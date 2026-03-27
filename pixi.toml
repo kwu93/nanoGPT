@@ -1,0 +1,21 @@
+[workspace]
+authors = ["Kev Wu <kevin.x.wu93@gmail.com>"]
+channels = ["conda-forge"]
+name = "nanoGPT"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = "3.11.*"
+numpy = ">=2.4.3,<3"
+pytorch = ">=2.10.0,<3"
+
+[pypi-dependencies]
+ipykernel = ">=6"
+transformers = ">=5.3.0, <6"
+datasets = ">=4.8.4, <5"
+tiktoken = ">=0.12.0, <0.13"
+wandb = ">=0.25.1, <0.26"
+tqdm = ">=4.67.3, <5"

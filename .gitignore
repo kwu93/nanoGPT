@@ -9,4 +9,6 @@ __pycache__/
 *.pyc
 input.txt
 env/
-venv/
+venv/# pixi environments
+.pixi/*
+!.pixi/config.toml
