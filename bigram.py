@@ -12,7 +12,7 @@ max_iters = 5000
 device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
 eval_iters = 200
 eval_interval = 300
-num_heads = 4
+n_heads = 4
 
 n_embed = 32
 
@@ -71,15 +71,15 @@ testX, testY = make_batch(train_data)
 #### ---- Define language model ----
 
 class Block(nn.Module):
-    def __init__(self, num_heads):
+    def __init__(self, n_embed, n_heads):
         super().__init__()
-        head_size = n_embed // num_heads
-        self.sa_head = MultiHeadAttention(num_heads, head_size)
+        head_size = n_embed // n_heads
+        self.sa_head = MultiHeadAttention(n_heads, head_size)
         self.ffn = FeedForward(n_embed) # n_embed
 
     def forward(self, x):
-        x = self.sa_head(x)
-        x = self.ffn(x)
+        x = self.sa_head(x) + x
+        x = self.ffn(x) + x
         return x
 
 class FeedForward(nn.Module):
@@ -90,7 +90,6 @@ class FeedForward(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(size, size, bias=True),
             nn.ReLU(),
-#            nn.Linear(size, size, bias=True),
         )
     
     def forward(self, x):
@@ -102,11 +101,11 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed) # (B, T, C)
         self.pos_embedding_table = nn.Embedding(context_window, n_embed) # (B, T, C)
-        # Try 1
-#        self.sa_head = MultiHeadAttention(num_heads, n_embed // num_heads) # // Divide by num heads for equal params?
-#        self.ffn = FeedForward(n_embed)
-        # Try 2
-        self.block = Block(num_heads)
+        self.blocks = nn.Sequential(
+            Block(n_embed, n_heads),
+            Block(n_embed, n_heads),
+            Block(n_embed, n_heads),
+        )
         self.lm_head = nn.Linear(n_embed, vocab_size) # (B ,T, vocab size)
 
     def forward(self, idx, targets=None):
@@ -114,7 +113,7 @@ class BigramLanguageModel(nn.Module):
         token_embeddings = self.token_embedding_table(idx)
         pos_embeddings = self.pos_embedding_table(torch.arange(T, device=device))
         x = token_embeddings + pos_embeddings
-        x = self.block(x)
+        x = self.blocks(x)
         logits = self.lm_head(x)
         if targets is None:
             loss = None
@@ -137,11 +136,11 @@ class BigramLanguageModel(nn.Module):
     
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, num_heads, head_size):
+    def __init__(self, n_heads, head_size):
         super().__init__()
-        self.num_heads = num_heads
+        self.n_heads = n_heads
         self.head_size = head_size
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(n_heads)])
     
     def forward(self, x):
         return torch.cat([head(x) for head in self.heads], dim=-1)
