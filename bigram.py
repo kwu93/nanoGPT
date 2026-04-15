@@ -5,16 +5,17 @@ from torch.nn import functional as F
 
 
 #### -------- Hyperparameters --------
-batch_size = 32
-learning_rate =  1e-3
-context_window = 8
+batch_size = 64
+learning_rate =  3e-4
+context_window = 256
 max_iters = 5000
 device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
 eval_iters = 200
 eval_interval = 300
-n_heads = 4
-
-n_embed = 32
+n_heads = 6
+n_layers = 6
+dropout = 0.2
+n_embed = 384
 
 train_frac = 0.9
 
@@ -76,11 +77,16 @@ class Block(nn.Module):
         head_size = n_embed // n_heads
         self.sa_head = MultiHeadAttention(n_heads, head_size)
         self.ffn = FeedForward(n_embed) # n_embed
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.ln2 = nn.LayerNorm(n_embed)
 
     def forward(self, x):
-        x = self.sa_head(x) + x
-        x = self.ffn(x) + x
+        # This piece defines the residual transformation. 
+        #
+        x = self.sa_head(self.ln1(x)) + x
+        x = self.ffn(self.ln2(x)) + x
         return x
+
 
 class FeedForward(nn.Module):
     def __init__(self, size):
@@ -88,8 +94,10 @@ class FeedForward(nn.Module):
         self.size = size
 
         self.net = nn.Sequential(
-            nn.Linear(size, size, bias=True),
+            nn.Linear(size, 4 * size, bias=True),
             nn.ReLU(),
+            nn.Linear(4 * size, size, bias=True),
+            nn.Dropout(dropout)
         )
     
     def forward(self, x):
@@ -102,10 +110,9 @@ class BigramLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed) # (B, T, C)
         self.pos_embedding_table = nn.Embedding(context_window, n_embed) # (B, T, C)
         self.blocks = nn.Sequential(
-            Block(n_embed, n_heads),
-            Block(n_embed, n_heads),
-            Block(n_embed, n_heads),
+            *[Block(n_embed, n_heads) for _ in range(n_layers)], 
         )
+        self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size) # (B ,T, vocab size)
 
     def forward(self, idx, targets=None):
@@ -114,6 +121,7 @@ class BigramLanguageModel(nn.Module):
         pos_embeddings = self.pos_embedding_table(torch.arange(T, device=device))
         x = token_embeddings + pos_embeddings
         x = self.blocks(x)
+        x = self.ln_f(x)
         logits = self.lm_head(x)
         if targets is None:
             loss = None
@@ -141,16 +149,14 @@ class MultiHeadAttention(nn.Module):
         self.n_heads = n_heads
         self.head_size = head_size
         self.heads = nn.ModuleList([Head(head_size) for _ in range(n_heads)])
+        self.proj = nn.Linear(n_embed, n_embed)
+        self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
-        return torch.cat([head(x) for head in self.heads], dim=-1)
-
-
-
-
-
-
-
+        out = torch.cat([head(x) for head in self.heads], dim=-1)
+        out = self.proj(out)
+        out = self.dropout(out)
+        return out 
 
 class Head(nn.Module):
     def __init__(self, head_size):
@@ -159,6 +165,7 @@ class Head(nn.Module):
         self.key = nn.Linear(n_embed, head_size, bias=False)
         self.query = nn.Linear(n_embed, head_size, bias=False)
         self.value = nn.Linear(n_embed, head_size, bias=False)
+        self.dropout = nn.Dropout(dropout)
         self.register_buffer('tril', torch.tril(torch.ones((context_window, context_window))))
 
     def forward(self, x):
@@ -173,27 +180,13 @@ class Head(nn.Module):
         # of context might be less than `context_window`.
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         wei = F.softmax(wei, dim=-1) # (B, T, T)
+        wei = self.dropout(wei) # TODO: Why does dropout happen here?
         out = wei @ v # (B, T, H)
         return out 
 
-
-
-
-
-
-
-
-
-
-
-    
 #### Training procedure
 
 m = BigramLanguageModel()
-
-# TODO: 'mps'?
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
 m = m.to(device)
 
 optimizer = torch.optim.AdamW(m.parameters(), lr = learning_rate)
