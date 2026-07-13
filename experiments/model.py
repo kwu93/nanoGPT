@@ -176,6 +176,44 @@ class RNNModel(AutoregressiveModel):
         return logits, loss
 
 
+@register('lstm')
+class LSTMModel(AutoregressiveModel):
+    """Gated recurrence. Where the vanilla rnn folds input into state through
+    one fixed tanh, the LSTM computes input-dependent multiplicative gates
+    that route information: forget (what to erase from the cell), input (what
+    to write), output (what to expose). The cell state c is an additive
+    highway across time, which is also what tames vanishing gradients."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        dim_embed, dim_hidden = config['dim_embed'], config['dim_hidden']
+        vocab_size = config['vocab_size']
+        self.token_embedding = nn.Embedding(vocab_size, dim_embed)
+        self.gates = nn.Linear(dim_embed + dim_hidden, 4 * dim_hidden)
+        self.head = nn.Linear(dim_hidden, vocab_size)
+
+    def forward(self, x, y=None):
+        B, T = x.shape
+        H = self.head.in_features
+        emb = self.token_embedding(x)
+        h = emb.new_zeros(B, H)
+        c = emb.new_zeros(B, H)
+        states = []
+        for t in range(T):
+            i, f, g, o = self.gates(torch.cat([emb[:, t], h], dim=-1)).chunk(4, dim=-1)
+            c = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
+            h = torch.sigmoid(o) * torch.tanh(c)
+            states.append(h)
+        logits = self.head(torch.stack(states, dim=1))
+        if y is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            loss = F.cross_entropy(logits.view(B * T, C), y.view(B * T))
+        return logits, loss
+
+
 @register('mlp_sum')
 class SumMLPModel(AutoregressiveModel):
     """Order-blind ablation of ConcatMLPModel: sum the window's embeddings

@@ -14,14 +14,33 @@ Full per-context grids are in the two comparison entries below.
 | unigram table | no context | 3.328 | - |
 | per-position MLP (`mlp`) | any (context-blind) | 2.51 | 15k |
 | `mlp_sum` | 2 chars (degrades after) | 2.462 | 15k |
-| `attention`, 1 layer | 8-16 chars (degrades at 32) | 2.218 | 17k |
-| `attention`, 4 layers | 32 chars | 2.174 | 56k |
+| `attention`, 1 layer, 32 dims | 8-16 chars (degrades at 32) | 2.218 | 17k |
 | `mlp_concat` | 16 chars | 2.055 | 76k |
-| `rnn` | 32 chars | **1.970** (best neural) | 31k |
+| `lstm` H=64 | 32 chars | 2.033 | 31k |
+| `rnn` | 32 chars | **1.970** (best at <= 31k params) | 31k |
+| `lstm` H=128 | 32 chars | 1.923 | 93k |
+| `attention`, 6 layers x 128 dims | 32 chars | 1.913 | 1.2M |
+| `attention`, 6 layers x 384 dims, lr 3e-4 | 32 chars | **1.883** (best single neural) | 10.7M |
 | fixed n-gram table (a=0.01) | 4 chars (collapses to ln 65 by 32) | 1.876 | - |
 | Witten-Bell backoff | 4 chars | 1.790 | - |
-| Kneser-Ney backoff | 5 chars | **1.634** (best overall; the target) | - |
-| `bigram.py` transformer (384 dim, 6 layers) | 8 chars | ~1.5 reported, unmeasured in this harness | 10.8M |
+| Kneser-Ney backoff | 5 chars | **1.634** (best single model) | ~7.5M counts |
+| `lstm` H=128 + KN, lam=0.25 | 32 chars + tables | **1.567** (best overall) | both |
+
+## Cost accounting (storage / compute / data)
+
+Parameter counts, description length, and training compute are three different budgets; winners flip depending on which is held equal (2026-07-13 discussion).
+
+| model | stored numbers | ~size | train compute | tokens seen | val NLL |
+|---|---|---|---|---|---|
+| KN backoff, depth 8 | 7.5M counts | ~51 MB | ~16M dict ops (~1e-4 TFLOPs) | 892k, one pass | 1.634 |
+| `rnn` | 31k floats | 124 KB | 0.12 TFLOPs | 640k | 1.970 |
+| `lstm` H=128 | 93k floats | 372 KB | 0.36 TFLOPs | 640k | 1.923 |
+| `attention` 6L x 128d | 1.2M floats | 4.8 MB | 4.6 TFLOPs | 640k | 1.913 |
+| `attention` 6L x 384d | 10.7M floats | 43 MB | 41 TFLOPs | 640k | 1.883 |
+
+Readings: raw counts overstate both sides (KN's singletons are shrunk to ~zero effective DOF by discounting; SGD-at-5000-iters is implicit early stopping), and KN's tables are close to a reorganized copy of the corpus - the MDL sense in which tables memorize rather than learn.
+At roughly equal description length (43 vs 51 MB) the big transformer still trails KN while spending ~400,000x the compute - but KN is at convergence by construction and every neural number is an at-budget snapshot of a still-falling curve.
+At equal compute, KN wins absurdly; at equal storage with compression-aware accounting, the small recurrent models are the honest champions; at equal tokens with compute unbound, the transformer's trajectory is the bet.
 
 ## Key learnings so far
 
@@ -35,6 +54,8 @@ Full per-context grids are in the two comparison entries below.
 8. Attention is not magic at tiny scale: one layer is a selective sum (window averaged into one vector before the FFN), and at 32 dims it loses to concat and rnn at every context length, degrading 16 -> 32 as diffuse softmax drifts toward the sum pathology. Depth 2-4 narrows but does not close the gap; bigram.py's win at the same token budget uses 384 dims, pointing at width as the missing variable (untested).
 9. Position-averaged loss hides a warm-up effect: position t has only t+1 chars of effective context, so seq_len=S really means mean context (S+1)/2. Short-seq cells are dominated by context-starved positions; compare against position-averaged floors or mask warm-up positions.
 10. Supervision is a first-order variable: raising tokens/step 32 -> 128 was worth ~0.10 nats to the rnn and cut seed variance ~15x, and with equal supervision the neural bigram sits 0.002 off its exact information floor. Attribute gaps to architecture only after matching tokens/step.
+11. Gating costs 4x parameters per unit of state width: at equal params the LSTM loses to the vanilla rnn (state width binds), at equal width it wins. "X beats Y" needs a stated matching - params, width, storage, or compute - because the winner flips with the matching.
+12. Width unlocks attention (2.29 -> 1.88 with scale) but tokens cap everything: at 640k supervised tokens no neural model catches KN's one full counting pass. Meanwhile interpolating the LSTM with KN (lam=0.25) gives 1.567 - complementary errors, and the cheapest jump past both components.
 
 ## Reflections
 
@@ -42,6 +63,137 @@ The session's arc, compressed: "why doesn't capacity matter?" turned out to be t
 Counting-based floors (n-gram, bag, backoff) were the single most valuable instrument: every neural result got its meaning from the distance to a floor, not from its absolute value.
 Pre-registration earned its keep in refutations: WB's non-monotonicity exposed singleton over-trust, and attention missing its bands at every step of the rematch is what isolated width as the live hypothesis.
 Open questions carried forward: the width fan-out sweep on attention at seq_len=32 (the original question, finally answerable); training-budget scaling (everything neural is at-budget, not at-convergence); modified KN for a tighter classical floor; warm-up masking for cleaner comparisons.
+
+## 2026-07-13: Loss vs iterations - which at-budget rankings survive convergence?
+
+**Question.**
+Every neural scoreboard number is a 5000-iteration snapshot of a still-falling curve, while KN is converged by construction.
+Which rankings invert with 4x and 16x more training, and does any neural model pass KN (1.634)?
+
+**Method.**
+Five models at seq_len=32, ~128 tokens/step: `mlp_concat` k=32, `rnn` H=128, `lstm` H=128, `attention` 6L x 128d (lr 1e-3), `attention` 6L x 384d (6 heads, lr 3e-4, MPS).
+num_iters in {5k (existing, 3 seeds), 20k, 80k} - 80k = 10.2M tokens ~= 11.5 epochs.
+New runs: seed 0 only (seed std at this supervision was 0.003-0.02); eval_every scaled to num_iters/20 so every curve has 21 points; no LR schedule, no dropout (deliberately vanilla - regularization is a future entry).
+Curves land in runs.jsonl, so both final and minimum val loss are recoverable per run.
+
+**Prediction (pre-registered).**
+1. No rank inversions among the five at 80k (same order as 5k, gaps wider), except concat converges early: flat from 20k to 80k at ~2.0.
+2. The 10.7M transformer passes KN: min val in [1.50, 1.62] by 80k - the neural-beats-classical crossover happens at ~16x our standard budget.
+3. Overfitting appears where capacity/data is worst: the 384d model's val curve turns up before 80k (min < final); the small recurrent models do not turn up.
+4. The LSTM's edge over the rnn grows with training (>= 0.06 at 80k, from 0.047 at 5k): gating's trainability advantage compounds.
+5. On the compute axis the ranking flips: lstm at 80k (~5.8 TFLOPs) beats attention-384 at 5k (41 TFLOPs) by at least 0.05 - small-model-trained-longer beats big-model-trained-short at 7x less compute.
+
+**Result.**
+Pending.
+
+**Conclusion / next steps.**
+Pending.
+
+## 2026-07-13: Does width unlock attention? (the fan-out experiment, at last)
+
+**Question.**
+Tiny attention lost to everything; bigram.py wins with the same token budget but 384 dims.
+Is width the variable that makes attention work - the capacity fan-out the journal's first entry went looking for?
+
+**Method.**
+seq_len=32, batch 4 (~128 tokens/step), 3 seeds, on MPS (first GPU use; ~10 min per heavy run).
+Width grid at lr 1e-3, n_heads=4, dim_hidden = 4 x dim_embed: n_layers=1 with dim_embed {64, 128, 384}; n_layers=6 with dim_embed {64, 128}.
+Plus the bigram.py replication point: n_layers=6, dim_embed=384, n_heads=6, lr 3e-4 (10.7M params).
+
+**Prediction (pre-registered).**
+1. Width finally fans out: 1-layer val loss improves monotonically 2.29 (32d) -> below 2.0 by 384d.
+2. 6 layers x 128d lands in [1.75, 1.95], beating the rnn (1.970) - the first neural model to do so.
+3. The replication point (6L x 384d, lr 3e-4) reaches [1.45, 1.65], beating KN (1.634) and setting a new overall best.
+4. Depth and width interact: 6L x 64d beats 1L x 384d despite fewer parameters (composition plus capacity beats capacity alone).
+
+**Result.**
+seq_len=32, ~128 tokens/step, 3 seeds, MPS (first GPU runs in the harness):
+
+| config | params | val loss |
+|---|---|---|
+| 1L x 64d | 60k | 2.081 |
+| 1L x 128d | 219k | 1.986 |
+| 1L x 384d | 1.84M | 1.974 |
+| 6L x 64d | 309k | 1.971 |
+| 6L x 128d | 1.21M | 1.913 |
+| 6L x 384d (6 heads, lr 3e-4) | 10.7M | **1.883** |
+
+Prediction 1 confirmed: width finally fans out at 1 layer (2.291 -> 2.081 -> 1.986 -> 1.974), though saturating by 384d.
+Prediction 2 confirmed: 6L x 128d (1.913) beats the rnn (1.970) - the first attention configuration to do so.
+Prediction 3 REFUTED: the replication point reaches 1.883, not [1.45, 1.65], and does not beat KN (1.634).
+Post-hoc: the "~1.5 at the same budget" reference conflated settings - Karpathy's ~1.48 comes from block_size=256, batch 64, dropout, LR schedule, and far more tokens; at 640k supervised tokens (< 1 epoch) the 10.7M-param model is deeply data/budget-limited.
+Prediction 4 confirmed in direction, margin within noise: 6L x 64d (1.971, 309k params) matches 1L x 384d (1.974, 1.84M params) with 6x fewer parameters.
+
+**Conclusion / next steps.**
+Width was the missing variable for attention - capacity fans out at last, answering the journal's original question in the affirmative once the architecture can route information - but scale without tokens cannot catch counting: every neural point is budget-capped, and the gap to KN (0.25 nats) is now clearly a data/compute story, not an architecture story.
+Composition remains cheaper than capacity (6L x 64 ~= 1L x 384 at 1/6 the params).
+Next: train-longer curves (loss vs iterations per architecture) to see which at-budget rankings invert at convergence.
+
+## 2026-07-13: Are neural and Kneser-Ney errors complementary? (interpolation)
+
+**Question.**
+KN (1.634) and the best neural model make their nats in different places - KN by exact short-context counts, neural by generalization.
+Does interpolating them, p = lam * p_neural + (1 - lam) * p_KN, beat both components - the way neural LMs were actually deployed for their first decade?
+
+**Method.**
+Components: KN at depth 8, and the best neural model at seq_len=32 (rnn or lstm, whichever wins the gating entry), retrained at seed 0.
+Neural probabilities computed over the val stream in consecutive 32-char windows (warm-up positions included, consistent with training eval); KN probabilities per position from the full stream.
+NLL(lam) reported over a 21-point grid; both the best lam and the untuned lam=0.5 quoted, since selecting lam on val is a (mild, one-parameter) selection effect.
+
+**Prediction (pre-registered).**
+1. Even untuned lam=0.5 beats both components.
+2. The best mixture reaches <= 1.62: a new overall best (unless the width entry's replication point got there first).
+3. Optimal lam in [0.3, 0.6] - both components carry real weight, confirming complementarity rather than dominance.
+
+**Result.**
+Component selected by the gating entry: lstm H=128 (retrained seed 0, val 1.926; stream-eval NLL 1.921, consistent).
+KN component at depth 8: 1.659.
+NLL(lam) is a smooth U-curve: 1.659 (lam=0) -> 1.567 (lam=0.25) -> 1.592 (lam=0.5) -> 1.921 (lam=1).
+
+Prediction 1 confirmed: untuned lam=0.5 (1.592) beats both components.
+Prediction 2 confirmed: best mixture 1.5666 at lam=0.25 - new overall best, 0.067 below standalone KN's 1.634.
+Prediction 3 REFUTED, narrowly: optimal lam is 0.25, just under the predicted [0.3, 0.6]; the neural model earns a real but junior share.
+
+**Conclusion / next steps.**
+The errors are genuinely complementary: a model 0.29 nats worse than KN still improves it by 0.07 when mixed, meaning the LSTM knows things the tables cannot represent (and vice versa - KN's exact counts anchor the mixture, hence the junior lam).
+This reproduces the actual deployment recipe of 2000s-era neural LMs.
+Caveat logged: lam selected on val (one parameter; the lam=0.5 row is the untouched reference).
+Follow-up idea: per-position analysis of where the mixture's gains concentrate (prediction: positions where KN backs off below depth 3).
+
+## 2026-07-13: Gating vs plain recurrence (LSTM)
+
+**Question.**
+The vanilla rnn folds input into state through one fixed tanh; the LSTM computes input-dependent multiplicative gates (forget/input/output) around an additive cell-state highway.
+Is gating worth nats at equal parameters and budget?
+
+**Method.**
+`lstm` registered in `experiments/model.py` (hand-rolled fused-gate cell).
+seq_len=32, batch 4, 5000 iters, 3 seeds.
+Two sizes: dim_hidden=64 (31.1k params - matched to the rnn's 31.1k almost exactly) and dim_hidden=128 (92.9k, width-matched to the rnn's hidden size).
+
+**Prediction (pre-registered).**
+1. Param-matched (H=64): ties or beats the rnn, in [1.87, 1.97].
+2. Width-matched (H=128): clearly beats it, in [1.82, 1.93] - new best neural (pending the width entry).
+3. Both remain well short of KN (1.634): gating improves optimization and routing, but no recurrent state fully substitutes for exact short-context statistics at this budget.
+
+**Result.**
+seq_len=32, batch 4, 3 seeds:
+
+| config | params | state size | val loss |
+|---|---|---|---|
+| rnn H=128 (reference) | 31.1k | 128 | 1.970 +/- 0.003 |
+| lstm H=64 (param-matched) | 31.1k | 64 | 2.033 +/- 0.013 |
+| lstm H=128 (width-matched) | 92.9k | 128 | 1.923 +/- 0.006 |
+
+Prediction 1 REFUTED: the param-matched LSTM (2.033) loses to the rnn (1.970) by 0.063.
+Gates cost 4x the weights per unit of state, so at equal parameters the LSTM's memory is half as wide (64 vs 128 dims) - and at this scale, state width beats routing.
+Prediction 2 confirmed (barely - 1.923 vs the predicted ceiling 1.93): at equal state width, gating wins by 0.047, at 3x the parameters.
+Prediction 3 confirmed: both far from KN.
+
+**Conclusion / next steps.**
+Gating is not free: it buys trainability and routing at a 4x parameter tax on state width, and the tax only pays when state width is not the binding constraint.
+At 31k params the vanilla rnn remains the efficiency champion; the LSTM takes the (unmatched) neural recurrence crown at 1.923.
+Worth revisiting at longer context / more training, where the vanishing-gradient advantage should grow.
 
 ## 2026-07-13: Attention joins the comparison (+ classical columns)
 
