@@ -61,6 +61,40 @@ class MLPModel(AutoregressiveModel):
         return logits, loss
 
 
+@register('mlp_sum')
+class SumMLPModel(AutoregressiveModel):
+    """Order-blind ablation of ConcatMLPModel: sum the window's embeddings
+    instead of concatenating. Every offset shares the same downstream weights,
+    so the model sees only the multiset (bag) of the last context_k characters.
+    Order is destroyed, including which character is most recent, and the
+    parameter count does not grow with context_k."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        dim_embed, dim_hidden = config['dim_embed'], config['dim_hidden']
+        vocab_size = config['vocab_size']
+        self.token_embedding = nn.Embedding(vocab_size, dim_embed)
+        self.block = nn.Sequential(
+            nn.Linear(dim_embed, dim_hidden),
+            nn.ReLU(),
+            nn.Linear(dim_hidden, vocab_size),
+        )
+
+    def forward(self, x, y=None):
+        B, T = x.shape
+        k = self.config['context_k']
+        emb = self.token_embedding(x)
+        shifted = [F.pad(emb, (0, 0, j, 0))[:, :T] for j in range(k)]
+        logits = self.block(sum(shifted))
+        if y is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            loss = F.cross_entropy(logits.view(B * T, C), y.view(B * T))
+        return logits, loss
+
+
 @register('mlp_concat')
 class ConcatMLPModel(AutoregressiveModel):
     """Bengio (2003)-style neural n-gram: at each position, concatenate the
