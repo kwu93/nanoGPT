@@ -3,22 +3,25 @@
 Working log of experiments on the from-scratch models (`solo.py` lineage, `experiments/` framework).
 Convention: when a research question comes up, log the proposed explanation here as a hypothesis with a falsifiable prediction *before* running the experiment, then record the result.
 
-## Scoreboard (as of 2026-07-13)
+## Scoreboard (as of 2026-07-13, end of session)
 
 Val NLL in nats/char on tiny Shakespeare (892k train / 223k val chars, vocab 65).
-Neural runs: 5000 iters, batch 4, dim_embed 32, dim_hidden 128, mean over 3 seeds.
+Standard setting: ~128 tokens/step, 5000 iters, dim_embed 32, dim_hidden 128, mean over 3 seeds; each model at its best measured context.
+Full per-context grids are in the two comparison entries below.
 
-| model | context seen | val NLL |
-|---|---|---|
-| unigram table | none | 3.328 |
-| per-position MLP (`mlp`) | 1 char | 2.544 |
-| `mlp_sum` k=2 | bag of 2 | 2.449 |
-| bigram table | 1 char | 2.500 |
-| `mlp_concat` k=2 | 2 chars | 2.244 |
-| `mlp_concat` k=4 | 4 chars | **2.164** (best neural so far) |
-| Witten-Bell backoff n=5 | 4 chars | 1.790 |
-| Kneser-Ney backoff n=6 | 5 chars | **1.634** (best classical; current target) |
-| attention (`bigram.py`, 6 layers, 10.8M params) | 8 chars | ~1.5 expected, not yet measured here |
+| model | best at | val NLL | params |
+|---|---|---|---|
+| unigram table | no context | 3.328 | - |
+| per-position MLP (`mlp`) | any (context-blind) | 2.51 | 15k |
+| `mlp_sum` | 2 chars (degrades after) | 2.462 | 15k |
+| `attention`, 1 layer | 8-16 chars (degrades at 32) | 2.218 | 17k |
+| `attention`, 4 layers | 32 chars | 2.174 | 56k |
+| `mlp_concat` | 16 chars | 2.055 | 76k |
+| `rnn` | 32 chars | **1.970** (best neural) | 31k |
+| fixed n-gram table (a=0.01) | 4 chars (collapses to ln 65 by 32) | 1.876 | - |
+| Witten-Bell backoff | 4 chars | 1.790 | - |
+| Kneser-Ney backoff | 5 chars | **1.634** (best overall; the target) | - |
+| `bigram.py` transformer (384 dim, 6 layers) | 8 chars | ~1.5 reported, unmeasured in this harness | 10.8M |
 
 ## Key learnings so far
 
@@ -28,7 +31,178 @@ Neural runs: 5000 iters, batch 4, dim_embed 32, dim_hidden 128, mean over 3 seed
 4. Summing raw embeddings actively hurts as the window grows (k>=4 is worse than no context): recency dilution plus superposition interference - information present in the input is useless if the architecture cannot separate it.
 5. Count tables die of context sparsity (bag-8: 64% singleton contexts, 34% of val contexts novel); back-off fixes most of it and discounting fixes most of the rest (fixed table 2.88 -> WB 2.01 -> KN 1.65 at n=8). Singleton over-trust was the dominant residual, per the confirmed KN prediction.
 6. Well-engineered classical baselines are strong: KN (1990s counting) beats our best neural model by 0.53 nats at this scale, and would trail a 6-layer transformer by only ~0.13. Weak baselines flatter; strong ones keep you honest.
-7. Methodology that paid off: pre-registered falsifiable predictions (2 of 9 were wrong in informative ways), fixed seeds (bit-identical cross-model checks at k=1), floors/ceilings computed from data as anchors, and normalization sanity checks before trusting new probability models.
+7. Methodology that paid off: pre-registered falsifiable predictions (wrong ones were the most informative), fixed seeds (bit-identical cross-model checks at k=1), floors/ceilings computed from data as anchors, and normalization sanity checks before trusting new probability models.
+8. Attention is not magic at tiny scale: one layer is a selective sum (window averaged into one vector before the FFN), and at 32 dims it loses to concat and rnn at every context length, degrading 16 -> 32 as diffuse softmax drifts toward the sum pathology. Depth 2-4 narrows but does not close the gap; bigram.py's win at the same token budget uses 384 dims, pointing at width as the missing variable (untested).
+9. Position-averaged loss hides a warm-up effect: position t has only t+1 chars of effective context, so seq_len=S really means mean context (S+1)/2. Short-seq cells are dominated by context-starved positions; compare against position-averaged floors or mask warm-up positions.
+10. Supervision is a first-order variable: raising tokens/step 32 -> 128 was worth ~0.10 nats to the rnn and cut seed variance ~15x, and with equal supervision the neural bigram sits 0.002 off its exact information floor. Attribute gaps to architecture only after matching tokens/step.
+
+## Reflections
+
+The session's arc, compressed: "why doesn't capacity matter?" turned out to be the wrong first question - the right ladder was information access (what can the prediction see), then mechanism (how is it combined: sum < fixed offsets < composition, with dynamic selection pending scale), and only then capacity.
+Counting-based floors (n-gram, bag, backoff) were the single most valuable instrument: every neural result got its meaning from the distance to a floor, not from its absolute value.
+Pre-registration earned its keep in refutations: WB's non-monotonicity exposed singleton over-trust, and attention missing its bands at every step of the rematch is what isolated width as the live hypothesis.
+Open questions carried forward: the width fan-out sweep on attention at seq_len=32 (the original question, finally answerable); training-budget scaling (everything neural is at-budget, not at-convergence); modified KN for a tighter classical floor; warm-up masking for cleaner comparisons.
+
+## 2026-07-13: Attention joins the comparison (+ classical columns)
+
+**Question.**
+Where does attention land on the architecture-vs-context grid, and how does the whole neural family compare against the classical models (fixed n-gram table at alpha=0.01, Kneser-Ney back-off) at matching context?
+
+**Method.**
+`attention` registered in `experiments/model.py`: bigram.py in miniature - token + position embeddings, n_layers (default 1) of pre-LN causal multi-head attention (default 4 heads) + FFN with residuals, at baseline width (~17-18k params).
+Same grid as the previous entry: seq_len in {1, 2, 3, 4, 8, 16, 32}, ~128 tokens/step, 3 seeds.
+Classical columns computed exactly at each context length: fixed (S+1)-gram table with alpha=0.01 (bytes-keyed for the big contexts), KN at depth min(S, 8) (deeper levels are memory-prohibitive and near-weightless; the cap is noted where it binds).
+
+**Prediction (pre-registered).**
+1. Fixed table (a=0.01) collapses at long context: ~3.2 at 8 chars, ~4.0 at 16, ~4.17 (= ln 65, the all-unseen ceiling) at 32. KN stays saturated at ~1.65-1.67 from 4 chars on.
+2. Attention at seq_len=1 ~= 2.51 (degenerate self-attention = per-position MLP); at seq_len <= 4 within ~0.02 of concat/rnn (window saturation makes mechanism invisible).
+3. Attention improves monotonically through 32 with no concat-style flattening (dynamic weights can ignore uninformative distant tokens): [1.97, 2.05] at 16, [1.92, 2.04] at 32.
+4. Riskiest call: 1-layer attention does NOT beat the rnn at seq_len=32 (within 0.05 either side of 1.970). One round of mixing reaches everything but composes nothing; the rnn composes 32 nonlinear steps. If attention loses, the rematch is n_layers=2.
+5. Attention has the fewest parameters of any context-aware model at 32 (~18k vs rnn 31k, concat 142k), roughly flat in seq_len.
+
+**Result (round 1: n_layers=1).**
+Attention (mean of 3 seeds; max std 0.023) vs the prior grid:
+
+| seq_len | attention | rnn | mlp_concat | fixed table a=0.01 | KN |
+|---|---|---|---|---|---|
+| 1 | 2.509 | 2.510 | 2.506 | 2.509 | 2.504 |
+| 2 | 2.361 | 2.337 | 2.336 | 2.132 | 2.100 |
+| 3 | 2.311 | 2.248 | 2.247 | 1.885 | 1.796 |
+| 4 | 2.264 | 2.185 | 2.185 | 1.876 | 1.654 |
+| 8 | 2.218 | 2.070 | 2.088 | 3.253 | 1.659 |
+| 16 | 2.218 | 2.003 | 2.055 | 4.142 | 1.659* |
+| 32 | 2.291 | 1.970 | 2.059 | 4.174 | 1.659* |
+
+*KN capped at depth 8; fixed table computed exactly at each context (4.174 = ln 65: every context unseen).
+
+Prediction 1 confirmed precisely (fixed-table collapse to the all-unseen ceiling; KN saturation).
+Prediction 4 confirmed directionally but not in magnitude: 1-layer attention loses to the rnn at seq_len=32 by 0.32, far outside the predicted +/- 0.05 band.
+Predictions 2 and 3 REFUTED: attention trails concat/rnn from seq_len=3 on (0.06-0.08 at 3-4), and it is non-monotone, degrading from 16 to 32 (2.218 -> 2.291, ~3x seed std).
+Prediction 5 confirmed (17.9k params at 32).
+
+Post-hoc diagnosis: a single attention layer is a *selective sum* - the window is compressed to one dim_embed vector by a softmax-weighted average before the FFN sees it.
+Unlike concat (which hands the FFN all k x C dims) and the rnn (which composes sequentially), one round of mixing is lossy per position; and when undertrained softmax weights stay diffuse, a wide window drifts toward the mlp_sum pathology (consistent with the 16 -> 32 degradation and with 2.29 sitting between concat 2.06 and sum 3.00).
+Depth should fix both failure modes: layer 2 can read features already mixed by layer 1 (composition), and more training sharpens the softmax (selection).
+
+**Rematch prediction (pre-registered): n_layers in {2, 4} at seq_len=32.**
+1. n_layers=2 (~30.6k params, matching the rnn's 31k almost exactly): improves to 2.05-2.15 but still behind the rnn (1.970).
+2. n_layers=4 (~56k): 1.95-2.10, at best matching the rnn at this budget.
+
+**Result (rematch).**
+At seq_len=32, 128 tokens/step, 3 seeds:
+
+| model | params | val loss |
+|---|---|---|
+| attention, 1 layer | 17.9k | 2.291 +/- 0.023 |
+| attention, 2 layers | 30.5k | 2.238 +/- 0.013 |
+| attention, 4 layers | 55.7k | 2.174 +/- 0.019 |
+| rnn (reference) | 31.1k | 1.970 +/- 0.003 |
+
+Both rematch predictions REFUTED: 2 layers lands at 2.238 (predicted 2.05-2.15) and 4 layers at 2.174 (predicted 1.95-2.10).
+Depth buys a steady but slow ~0.05-0.06 per doubling; even 4 layers trails concat (2.059), and the parameter-matched comparison is stark: 2-layer attention (30.5k params) loses to the rnn (31.1k) by 0.27 nats.
+
+**Conclusion / next steps.**
+At this scale and budget, attention is the *worst* context-aware neural mechanism, despite being the one that wins at real scale.
+The recurrent inductive bias (recency via composition) comes for free; attention must learn what to look at from scratch through diffuse softmax weights and position embeddings, and 5000 iters at 32 dims is not enough.
+The outstanding anomaly makes the missing variable conspicuous: bigram.py reaches ~1.5 with the SAME token budget (5000 iters x 128 tokens/step) but 384 dims / 6 heads / 6 layers / 10.8M params - suggesting width (head dim, embedding capacity), not depth, is what our attention lacks.
+This finally reconnects to the very first journal entry: the dim_embed x dim_hidden fan-out sweep, now on a model that can use capacity.
+Next experiment: width sweep on attention at seq_len=32 (dim_embed 32 -> 384), watching for the capacity fan-out the per-position MLP could never show; note bigram.py also differs in lr (3e-4 AdamW vs our 1e-3 Adam) - worth controlling.
+
+## 2026-07-13: All architectures vs context length (the full comparison)
+
+**Question.**
+How do all four neural architectures (`mlp`, `mlp_sum`, `mlp_concat`, `rnn`) scale with context length across seq_len in {1, 2, 3, 4, 8, 16, 32}?
+
+**Design.**
+Context length and seq_len are tied per model: `mlp` sees 1 char regardless, `mlp_sum`/`mlp_concat` get context_k = seq_len, `rnn`'s context is seq_len itself.
+Tokens per step are held at ~128 for every cell (batch_size = 128 // seq_len; 126 at seq_len=3) to remove the supervision confound quantified in the RNN entry.
+3 seeds per cell, 84 runs, baseline width, 5000 iters.
+Reference floors: KN backoff at matching context (2.504 at 1 char, 2.100 at 2, 1.796 at 3, 1.654 at 4; ~1.63 saturated beyond).
+
+**Prediction (pre-registered).**
+1. `mlp` is flat (2.49-2.55) at every seq_len: context is structurally 1 char, and supervision is now equalized.
+2. `mlp_sum` peaks at seq_len=2 (~2.35-2.45) and degrades monotonically after, ending worst of all models at 32 (>= 2.7): recency dilution plus superposition.
+3. `mlp_concat` improves through seq_len ~8 (to ~2.00-2.10), then goes flat or slightly worse by 32: distant offsets carry little signal but add per-offset weights (131k params at k=32) and noise.
+4. `rnn` tracks `mlp_concat` within ~0.05 at seq_len <= 4, is strictly best at >= 16, and improves monotonically to ~1.97 at 32.
+5. At seq_len=1 all four models agree within ~0.05 (same information, near-same architecture).
+6. No neural model reaches the KN floor at matching context; gap >= 0.25 nats everywhere.
+
+**Result.**
+Val loss (mean over 3 seeds; max seed std 0.024 across all 28 cells):
+
+| seq_len | mlp | mlp_sum | mlp_concat | rnn | concat params | rnn params |
+|---|---|---|---|---|---|---|
+| 1 | 2.506 | 2.506 | 2.506 | 2.510 | 14.7k | 31.1k |
+| 2 | 2.510 | 2.462 | 2.336 | 2.337 | 18.8k | 31.1k |
+| 3 | 2.528 | 2.508 | 2.247 | 2.248 | 22.9k | 31.1k |
+| 4 | 2.515 | 2.537 | 2.185 | 2.185 | 27.0k | 31.1k |
+| 8 | 2.530 | 2.704 | 2.088 | 2.070 | 43.4k | 31.1k |
+| 16 | 2.525 | 2.871 | 2.055 | 2.003 | 76.1k | 31.1k |
+| 32 | 2.526 | 3.002 | 2.059 | **1.970** | 141.7k | 31.1k |
+
+Predictions 1, 2, 4, 5 confirmed; 3 confirmed with the plateau arriving at 16 rather than 8; 6 REFUTED at short context.
+Details:
+1. `mlp` flat at 2.506-2.530 across a 32x context range.
+2. `mlp_sum` peaks at seq_len=2 (2.462), degrades monotonically to 3.002, worst model from seq_len=4 on.
+3. `mlp_concat` improves through 16, then a within-noise uptick at 32 (+0.004).
+4. `rnn` tracks concat to within 0.003 at seq_len <= 4 (predicted 0.05 - the agreement is nearly exact), pulls ahead from 8, and wins clearly at 16 (0.051) and 32 (0.089) with 4.6x fewer parameters than concat at 32.
+5. All four models within 0.0045 of each other at seq_len=1.
+6. At seq_len=1 the gap to the KN floor is 0.002, not >= 0.25: with 128 tokens/step the neural bigram converges essentially to its information floor. The earlier 0.03-0.05 bigram-ceiling gap was undertraining, not architecture.
+
+Subtlety surfaced by an apparent anomaly: concat k=2 here (2.336, seq_len=2) looks worse than the earlier concat k=2 run (2.244, seq_len=8) despite 4x more supervision.
+Explanation: the loss averages over positions, and position t only has t+1 characters of effective context, so at seq_len=2 half of all predictions are context-starved warm-up positions vs 1/8 at seq_len=8.
+Mean effective context at seq_len=S is (S+1)/2, identical for all models (which is why concat and rnn still match), but it means naive "neural at context S vs KN at depth S" comparisons overstate the neural handicap.
+Against position-averaged KN floors (e.g. ~2.30 at seq_len=2, ~1.70 at 32), the neural models sit 0.03-0.34 above, not 0.24-0.53.
+
+**Conclusion / next steps.**
+Mechanism is irrelevant when the window is small: per-offset weights and composed state land on identical losses at seq_len <= 4, because both capture everything a short window offers.
+Mechanism decides everything at scale: shared-weight composition (rnn) keeps improving where per-offset weights (concat) flatten and order-blind addition (sum) actively collapses - and it does so with constant parameters.
+The context axis now cleanly separates all four architectures, answering the original fan-out question in mechanism form.
+Future comparisons should either mask warm-up positions or quote mean effective context (S+1)/2.
+Next: attention at seq_len=32, 128 tokens/step, 3 seeds - beat rnn 1.970, chase KN 1.634.
+
+## 2026-07-13: Is an RNN the missing intermediate between concat and attention?
+
+**Question.**
+The architecture table so far: sum (shared weights, order lost), concat (per-offset weights, order structural, params grow with window), attention (shared weights, dynamic selection, order injected).
+There is a hole: shared weights *and* order awareness with no parameter growth in context length.
+Does a vanilla RNN fill it, and where does it land on the scoreboard?
+
+**Hypothesis.**
+The RNN (h_t = tanh(Wx e_t + Wh h_{t-1}), registered as `rnn`) processes the window sequentially through one shared cell.
+Like `mlp_sum` it reuses the same weights for every offset, but it *composes* instead of *adds*: function composition is non-commutative, so order survives structurally.
+The hidden state is a learned fixed-size summary of the entire prefix, so context is unbounded in principle (capped at `seq_len` here because batches are random crops with h_0 = 0) and the parameter count is independent of context length.
+Historically this is the step that displaced KN n-grams (Mikolov 2010); its own known weaknesses - the fixed-size state bottleneck and vanishing gradients through tanh chains - are what attention later removed.
+
+**Prediction (pre-registered).**
+Baseline width, 5000 iters, batch 4, 3 seeds, `seq_len` in {8, 32}:
+1. At seq_len=8 the RNN lands in the concat k=8 band (2.10-2.35): same accessible information, different mechanism, slightly harder optimization.
+2. It beats `mlp_sum` k=8 (2.764) by >= 0.4 nats at identical parameter sharing - the direct demonstration that composition preserves what addition destroys.
+3. Parameter count is identical at seq_len 8 and 32 (~31k), unlike concat (which would need ~131k input weights at k=32).
+4. seq_len 8 -> 32 improves val loss by < 0.1 nats at this budget: vanishing gradients plus undertraining limit the *effective* context well below 32. Confound noted: T=32 also supervises 4x more tokens per step, so any gain is an upper bound on the context effect.
+
+**Result.**
+Run 2026-07-13, 3 seeds each, appended to `runs.jsonl` (params 31,073 in every configuration):
+
+| config | tokens/step | val loss (mean +/- std) |
+|---|---|---|
+| seq_len=8, batch=4 | 32 | 2.1745 +/- 0.0375 |
+| seq_len=8, batch=16 (control) | 128 | 2.0704 +/- 0.0123 |
+| seq_len=32, batch=4 | 128 | **1.9695 +/- 0.0025** |
+
+Prediction 1 confirmed: seq_len=8 RNN (2.174) lands within noise of concat k=8 (2.180) - same accessible information, same loss, different mechanism.
+Prediction 2 confirmed: 0.59 nats better than `mlp_sum` k=8 (2.764) with the same weight sharing; composition preserves what addition destroys.
+Prediction 3 confirmed: parameter count identical at seq_len 8 and 32.
+Prediction 4 REFUTED: seq_len 8 -> 32 improved val loss by 0.205 nats, double the predicted < 0.1.
+The batch=16 control decomposes the gain almost exactly in half: 0.104 from more supervision (32 -> 128 tokens/step at fixed context) and 0.101 from context alone (8 -> 32 chars at fixed tokens/step).
+So characters 9-32 back are worth ~0.10 nats to a vanilla RNN at this budget - the tanh state carries usable information much further back than the vanishing-gradient intuition suggested.
+Also notable: seed variance collapses with more tokens/step (std 0.0375 -> 0.0025).
+
+**Conclusion / next steps.**
+The RNN completes the architecture table: shared weights AND order awareness AND zero parameter growth in context length - the first model in the series where extending context is architecturally free.
+New best neural: 1.9695, still 0.34 nats behind KN (1.634).
+The 0.10-nat supervision effect is a reminder that our 5000-iter budget undertrains everything; scoreboard comparisons are at-budget, not at-convergence.
+Next: attention, target 1.634; also worth running mlp_concat and attention at the seq_len=32 / batch=4 setting for a fair three-way mechanism comparison at equal tokens/step.
 
 ## 2026-07-13: Kneser-Ney vs the singleton diagnosis
 

@@ -61,6 +61,121 @@ class MLPModel(AutoregressiveModel):
         return logits, loss
 
 
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim, n_heads, seq_len):
+        super().__init__()
+        assert dim % n_heads == 0
+        self.n_heads = n_heads
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.proj = nn.Linear(dim, dim)
+        self.register_buffer('mask', torch.tril(torch.ones(seq_len, seq_len)).bool())
+
+    def forward(self, x):
+        B, T, C = x.shape
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        hs = C // self.n_heads
+        q = q.view(B, T, self.n_heads, hs).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, hs).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, hs).transpose(1, 2)
+        att = (q @ k.transpose(-2, -1)) * hs ** -0.5
+        att = att.masked_fill(~self.mask[:T, :T], float('-inf'))
+        att = F.softmax(att, dim=-1)
+        out = (att @ v).transpose(1, 2).reshape(B, T, C)
+        return self.proj(out)
+
+
+class Block(nn.Module):
+    def __init__(self, dim, dim_hidden, n_heads, seq_len):
+        super().__init__()
+        self.attn = CausalSelfAttention(dim, n_heads, seq_len)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim_hidden),
+            nn.ReLU(),
+            nn.Linear(dim_hidden, dim),
+        )
+        self.ln1 = nn.LayerNorm(dim)
+        self.ln2 = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        x = x + self.ffn(self.ln2(x))
+        return x
+
+
+@register('attention')
+class AttentionModel(AutoregressiveModel):
+    """bigram.py in miniature: token + position embeddings, n_layers of
+    [causal multi-head attention + FFN] with pre-layernorm residuals, linear
+    head. The mixing weights are activations computed per input rather than
+    parameters, so context reach is the full window in one layer, at O(T^2)
+    attention cost and with near-constant parameters in seq_len."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        dim_embed, dim_hidden = config['dim_embed'], config['dim_hidden']
+        vocab_size, seq_len = config['vocab_size'], config['seq_len']
+        n_heads = config.get('n_heads', 4)
+        n_layers = config.get('n_layers', 1)
+        self.token_embedding = nn.Embedding(vocab_size, dim_embed)
+        self.pos_embedding = nn.Embedding(seq_len, dim_embed)
+        self.blocks = nn.ModuleList(
+            Block(dim_embed, dim_hidden, n_heads, seq_len) for _ in range(n_layers))
+        self.ln_f = nn.LayerNorm(dim_embed)
+        self.head = nn.Linear(dim_embed, vocab_size)
+
+    def forward(self, x, y=None):
+        B, T = x.shape
+        tok = self.token_embedding(x)
+        pos = self.pos_embedding(torch.arange(T, device=x.device))
+        h = tok + pos
+        for block in self.blocks:
+            h = block(h)
+        logits = self.head(self.ln_f(h))
+        if y is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            loss = F.cross_entropy(logits.view(B * T, C), y.view(B * T))
+        return logits, loss
+
+
+@register('rnn')
+class RNNModel(AutoregressiveModel):
+    """Vanilla recurrent LM (Elman/Mikolov style): one shared cell updates a
+    fixed-size hidden state per character, h_t = tanh(Wx e_t + Wh h_{t-1}),
+    read out for the next-char prediction at every position. Shares weights
+    across offsets like mlp_sum, but composition is non-commutative so order
+    survives; parameter count is independent of context length, and context
+    is unbounded in principle (capped at seq_len here by the batch window)."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        dim_embed, dim_hidden = config['dim_embed'], config['dim_hidden']
+        vocab_size = config['vocab_size']
+        self.token_embedding = nn.Embedding(vocab_size, dim_embed)
+        self.wx = nn.Linear(dim_embed, dim_hidden)
+        self.wh = nn.Linear(dim_hidden, dim_hidden, bias=False)
+        self.head = nn.Linear(dim_hidden, vocab_size)
+
+    def forward(self, x, y=None):
+        B, T = x.shape
+        emb = self.token_embedding(x)
+        h = emb.new_zeros(B, self.wh.in_features)
+        states = []
+        for t in range(T):
+            h = torch.tanh(self.wx(emb[:, t]) + self.wh(h))
+            states.append(h)
+        logits = self.head(torch.stack(states, dim=1))
+        if y is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            loss = F.cross_entropy(logits.view(B * T, C), y.view(B * T))
+        return logits, loss
+
+
 @register('mlp_sum')
 class SumMLPModel(AutoregressiveModel):
     """Order-blind ablation of ConcatMLPModel: sum the window's embeddings
