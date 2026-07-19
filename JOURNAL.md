@@ -26,6 +26,9 @@ Full per-context grids are in the two comparison entries below.
 | Kneser-Ney backoff | 5 chars | **1.634** (best single model) | ~7.5M counts |
 | `lstm` H=128 + KN, lam=0.25 | 32 chars + tables | **1.567** (best overall) | both |
 
+At 16x budget (80k iters ~= 11.5 epochs, seed 0): `lstm` 1.713 (still falling), `attention` 6L x 128d 1.687, `attention` 6L x 384d 1.669 at its minimum (overfits after iter 52k).
+KN's 1.634 remains unbeaten by every single model; the 1.567 mixture is still best overall.
+
 ## Cost accounting (storage / compute / data)
 
 Parameter counts, description length, and training compute are three different budgets; winners flip depending on which is held equal (2026-07-13 discussion).
@@ -56,6 +59,10 @@ At equal compute, KN wins absurdly; at equal storage with compression-aware acco
 10. Supervision is a first-order variable: raising tokens/step 32 -> 128 was worth ~0.10 nats to the rnn and cut seed variance ~15x, and with equal supervision the neural bigram sits 0.002 off its exact information floor. Attribute gaps to architecture only after matching tokens/step.
 11. Gating costs 4x parameters per unit of state width: at equal params the LSTM loses to the vanilla rnn (state width binds), at equal width it wins. "X beats Y" needs a stated matching - params, width, storage, or compute - because the winner flips with the matching.
 12. Width unlocks attention (2.29 -> 1.88 with scale) but tokens cap everything: at 640k supervised tokens no neural model catches KN's one full counting pass. Meanwhile interpolating the LSTM with KN (lam=0.25) gives 1.567 - complementary errors, and the cheapest jump past both components.
+13. Sixteen times the training did not dethrone counting: unregularized scale overfits 892k chars before reaching the KN floor (the 10.7M model bottoms at 1.669 at iter 52k, then rises; KN stands at 1.634). Beating tables needs regularization and longer context, not just tokens - and the low-compute frontier belongs to small recurrent models (lstm 1.713 at 5.7 TFLOPs vs transformer 1.669 at 657 TFLOPs).
+14. Information-bound vs capacity-bound is a measured dissociation: across 15.7x parameters at fixed budget (context 8), the context-blind mlp moves 0.010 nats while every context-aware architecture gains 0.21-0.33 - and the mlp cannot even *memorize* past its floor (train stops at the train-split bigram entropy). Capacity only matters when the architecture can reach information it has not yet extracted.
+15. The params axis re-ranks mechanisms just like the width and budget axes did: the rnn-concat gap (~0.05) is scale-stable from 3.9k to 60k (weight sharing's win is not a scarcity artifact), the lstm's gate tax amortizes and overtakes concat at 60k, and attention stays last at every tier - at short context, capacity alone rehabilitates gating but not dynamic selection.
+16. Val NLL and sample quality dissociate in both directions: the best fixed 5-gram table by NLL (1.876) collapses to uniform white noise ~11 chars into generation (smoothing mass is an escape hatch to uniform, and novel contexts are absorbing: 46k seen of 65^4 possible), while the alpha=0 table with *infinite* val NLL samples beautifully. One-step NLL on gold histories cannot see compounding-error behavior; backoff is what makes counting robust in the generation regime.
 
 ## Reflections
 
@@ -63,6 +70,431 @@ The session's arc, compressed: "why doesn't capacity matter?" turned out to be t
 Counting-based floors (n-gram, bag, backoff) were the single most valuable instrument: every neural result got its meaning from the distance to a floor, not from its absolute value.
 Pre-registration earned its keep in refutations: WB's non-monotonicity exposed singleton over-trust, and attention missing its bands at every step of the rematch is what isolated width as the live hypothesis.
 Open questions carried forward: the width fan-out sweep on attention at seq_len=32 (the original question, finally answerable); training-budget scaling (everything neural is at-budget, not at-convergence); modified KN for a tighter classical floor; warm-up masking for cleaner comparisons.
+
+## 2026-07-16: Sampling the ladder - does text quality track val NLL?
+
+**Question.**
+Every result so far scores models by val NLL on real contexts, i.e. one-step prediction with a gold history.
+Generation is a different regime: the model consumes its own output, so one bad character can push the history off the data manifold (exposure bias).
+What does sampled text look like at each rung of the ladder - uniform random, unigram, bigram, trigram, 5-gram (fixed table, plus Witten-Bell and Kneser-Ney backoff at the same depth) - and does the context-blind `mlp` (val 2.51) read like the bigram table (val 2.50) it is information-equivalent to?
+
+**Method.**
+New `experiments/sample.py` (pixi task `sample`).
+One shared 8-char primer (the first speaker-turn boundary in the val split), one fixed seed, 400 generated chars per model, fresh rng per model.
+Count models built on the train split: fixed tables at k = 0/1/2/4 chars of context with alpha = 0.01, the alpha = 0 (pure ML) 5-gram as a control, and WB / KN backoff at depth 4.
+Convention reminder: "5-gram" = 4 chars of context (n = k+1).
+Neural: the saved per-position `mlp` (models/mlp-e32-h128-s0.pt).
+Each sample is labeled with the val NLL of the exact distribution sampled from, recomputed and sanity-checked against the ladder entries.
+
+**Prediction (pre-registered).**
+1. Texture tracks context length: random = uniform char soup (space is 1/65 ~= 1.5% of chars instead of the corpus's roughly 16%, so no word rhythm at all); unigram = word-length runs of unpronounceable letters (whitespace rhythm right, nothing else); bigram = pronounceable digraphs and accidental real 2-3 letter words; trigram = mostly pronounceable pseudo-words plus common real short words, first hints of the NAME-colon-newline speaker format; the 5-gram family = mostly real words, names, and correctly formatted speaker turns.
+2. Headline risk prediction: the alpha = 0.01 5-gram table - the best fixed table by val NLL (1.876) - degenerates during generation. Per step it puts about (65 - d) * 0.01 / (c + 0.65) mass on unseen continuations; averaged over visited contexts that is roughly 0.63 * K / N ~= 3% per char (K ~= 46k seen contexts, N = 892k), so a 400-char sample almost surely (p > 0.999) steps off the table at least once. An escape usually lands in a novel 4-char context (only ~46k of 65^4 ~= 17.9M are seen), where the distribution is uniform and the successor contexts stay novel. Expect visible collapse into white noise, probably within the first ~100 chars, possibly after a recovered stumble or two.
+3. The alpha = 0 ML control cannot leave seen support (a sampled continuation extends a seen 5-gram, whose 4-char suffix is again a seen context), so it stays Shakespeare-shaped for all 400 chars - the best-looking count sample, and the one closest to regurgitating the corpus. Its val NLL is infinite (novel val events get probability zero), the mirror image of prediction 2: NLL and sample quality can dissociate in both directions.
+4. WB and KN are structurally immune to the collapse (a novel context hands its mass to shorter contexts, never to uniform): no white-noise stretch, quality similar to the ML control, and WB vs KN indistinguishable by eye at this depth.
+5. The mlp sample is texturally indistinguishable from the bigram table sample: matched val NLL implies matched sample texture here, closing the loop on learning #1 in the generation regime.
+6. No rung produces grammatical English beyond a short phrase; even KN at depth 4 is locally Shakespearean and globally word salad.
+
+**Result.**
+Recomputed val NLLs match the ladder and scoreboard: unigram 3.3276, bigram 2.5085, trigram 2.1320, 5-gram (a=0.01) 1.8755, WB depth 4 1.7898, KN depth 4 1.6539, mlp 2.5094.
+Primer is `\n\nISABEL`; the whole 5-gram family completes it to "ISABELLA:" and, sharing seed and near-identical top distributions, opens with the same "LA:\nTruly" before diverging.
+Samples (seed 0, first ~200-280 of 400 chars shown; `pixi run sample` reproduces the full output):
+
+random (uniform), val NLL 4.174:
+
+```text
+qcUEH!& ;nduTayicWXvFoe
+MqX!kiq;'r W'GSON
+.
+eVdDbkLQznyLfwdpfgMr.YhpVLHOShs&vVKeYDHhZTIkMIsEBhb$'LpNmHCmr'$eIY3qQtmgBk$YNz?w'bYtGtes?kw$Kc,UbkvNPRx?T$OwbJzaw QpkNTOVBm'NFijhvv?-.iyvexr
+```
+
+unigram table (a=0.01), val NLL 3.328:
+
+```text
+lI
+rtiohur
+s
+o shTe
+ mljcywnlnd ogWettahaiadt:l srAt a er: d, iSm,ub lteueekyueoehrdont otw
+sxu wtre;rtIhet oi
+o
+oft s aewhGAt: OihrhOdrlvbhis dt rds
+b mKnu s ceewpWIstfaya trmvtosC mn dthi'gg yh
+```
+
+bigram table (a=0.01), val NLL 2.5085:
+
+```text
+OF ETornetl
+UChathan ashe:'thend se!
+Wine, ges o tilo g is LI ar?
+As,
+Nonthelyoounerdent stt two? tle tr, it sh s
+Tht t gethalof finor:
+Thuliou, vater h pent t hedve!
+Vindy busitroue rl!
+Whe me y,
+Turais nfu mod Pl hooust
+```
+
+trigram table (a=0.01), val NLL 2.132:
+
+```text
+LA:
+To sour
+gar; he Pater,--and and my, me;
+Fore to the loo in peo, fartay istripent?
+At tor try woul.
+Senclask taret the wilet all the thy mot it thich reiver heave froseve to wour bromerech, OxfEly gived wast ife ithous a the reir; I conumsed:
+Romfory, holl.
+
+QUEEN EDWARETHUMNIUS:
+What;
+```
+
+5-gram table (a=0.01), val NLL 1.8755 - the best fixed table by NLL:
+
+```text
+LA:
+Truly;V
+q!i;rWGO .edbLzyfdfM.hVHSsvKYHZIMsBb'pmCr$I3QmB$N?'YGe?wK,bvPxTObzwQkTVmNihv-ivx
+ryx3ysoSCnvEWPv!ia h!kUv&p&JOxXDCsB.FZXnXFNobxLWZq3Nu!oNo
+K'dEgw.r$LOSylHErsUJzH;snexvjqD3eh:MuXY?VV'yY
+```
+
+5-gram table (a=0, ML control), val NLL inf:
+
+```text
+LA:
+Truly:' mindeed,
+And know, gentlement of the stay hand Quintus wife:
+No.
+
+VOLUMNIA:
+Away withough to men
+That thy see you that my goodly prayers take hit the lusterously to-night so hope of yonder follow not an exerciful.
+
+CORIOLANUS:
+Your spot, here it spirit! mulberdsmen worst not pardon of thou should before, as long and weeders,
+```
+
+Witten-Bell backoff, depth 4, val NLL 1.7898:
+
+```text
+LA:
+Truly:'
+PAULINA:
+Even your gentlement of the stay happier's forth such divorce. I'll susestrawing to men
+That thy see you that my goodly prayers take hit the lust. What but with all him,
+If yondition of.
+
+QUEEN ELIZABETH:
+Nay, her mastiny:
+Whose here it spirit!
+
+COMINIUS:
+It is, them all in arms:
+```
+
+Kneser-Ney backoff, depth 4, val NLL 1.6539:
+
+```text
+LA:
+Truly:'
+Passes i' the your gentlement of the stay eithee can set any whereof, or soul: wertainst myself;
+So say you have does rest my wish:
+Stay war these and you to hundred, stampeditch left His good number,
+That with and bring the six years, I have knees,
+That al robest:
+Withink, so have offering not,--
+```
+
+mlp (per-position, e32 h128), val NLL 2.5094:
+
+```text
+is remhis keswhenlteredoca meaman youd INAlste grecofuesy hifoty here hath thig berelisseanongilost atho y we w ke e alces idy t, tr nd-d han tsoo we w y mer aim whioervoto,
+Preschan s uzed
+I s h. fo INVeprf pifie-mily m,-ennd ssay eizecodeld fleome inou inkee he t,
+Ase.
+```
+
+Prediction 1 confirmed, with one underestimate: the corpus space fraction is 15.2% (predicted "roughly 16%"), the ladder of textures is exactly as described, but the full NAME-colon-newline speaker format (blank line, capitalized blend-name, colon) is already fully formed at the trigram ("QUEEN EDWARETHUMNIUS:", "KINA:"), not merely hinted at.
+Prediction 2 confirmed, more violently than predicted: the a=0.01 5-gram escapes at generated char ~11 ("Truly;" then "V") and never recovers, so ~97% of the sample is uniform white noise, visually indistinguishable from the random model, despite the best fixed-table val NLL.
+Prediction 3 confirmed: the a=0 control stays Shakespeare-shaped for all 400 chars (VOLUMNIA, CORIOLANUS, and the blend "DUKE OF GAUNT" further in) with infinite val NLL.
+Prediction 4 confirmed: WB and KN never derail, and at this depth neither WB vs KN nor either vs the ML control is rankable by eye; the first divergence point is exactly where smoothing policy differs (a=0.01 samples ";V" off-table where ML/WB/KN sample ":'").
+Prediction 5 confirmed: the mlp (2.5094) and the bigram table (2.5085) produce the same digraph soup with accidental short real words ("here hath", "youd", vs "Wine", "me by"); matched NLL came with matched texture.
+Prediction 6 confirmed: everything is word salad above the phrase level; KN's longest locally coherent run is on the order of "That with and bring the six years, I have knees".
+
+**Conclusion / next steps.**
+Val NLL and generation quality dissociate in both directions at the same context depth: the best fixed-table NLL (1.876) produced white noise, and infinite val NLL (a=0) produced one of the best-looking samples.
+The mechanism is the regime, not the model class: NLL scores one-step prediction on gold histories, while generation compounds sampling errors; the fixed table's only escape hatch from a low-count context is smoothing mass, which teleports to uniform over an absorbing set of novel contexts, whereas backoff degrades one context length at a time and always returns.
+Smoothing policy, worth only 0.086 nats of NLL (a=0.01 1.876 vs WB 1.790), is the difference between noise and Shakespeare-shaped text once the model eats its own output.
+Texture otherwise tracks information access, confirming learning #1 in the generation regime: the 15k-param mlp writes exactly like the 65x65 count table it is information-equivalent to, down to a 0.001-nat NLL match.
+Next: sample the context-aware neural models (rnn / lstm / attention at context 32) against KN - do their 1.9-2.0 NLLs read better or worse than KN's 1.65 (word inventory vs longer-range structure)? And check whether the a=0.01 collapse time scales as predicted (~1 / (0.63 K / N) chars) at other depths.
+
+## 2026-07-14: The params-vs-loss frontier per architecture (3.9k / 15k / 60k, fixed budget)
+
+**Question.**
+The tiny-budget rematch left two constraints compounded: all four context-aware models cluster 0.12-0.26 nats below the bigram floor, and the seed-0 curves are still falling 0.07-0.10 nats over the final 2000 iters (checked from curves/*.csv), so the cluster is a budget-capped snapshot, not an asymptote.
+This entry isolates the parameter axis at the same training budget: a 3.9k / 15k / 60k frontier per architecture, to locate where each mechanism's capacity stops binding, where concat re-catches the rnn (the 15k-era tie broke at 3.9k), and whether width lifts attention off the bottom of the context-aware group.
+
+**Method.**
+Same budget and setting as the tiny rematch: batch 32 x seq_len 8 (256 tokens/step), lr 1e-3, 5000 iters = 1.28M tokens, 3 seeds, context_k 8 for the window models, appended to runs.jsonl.
+The 3.9k tier reuses the tiny-rematch runs unchanged (identical config).
+New tiers at ~15k and ~60k (+/-4%), dims found by closed-form param search holding each architecture's 3.9k aspect ratio (H/E) fixed, so the frontier varies capacity, not shape:
+
+| model | 15k config | 15k params | 60k config | 60k params |
+|---|---|---|---|---|
+| mlp | E50 H100 | 15,315 | E130 H260 | 60,515 |
+| mlp_sum | E36 H120 | 14,645 | E96 H320 | 58,145 |
+| mlp_concat | E20 H60 | 14,925 | E44 H132 | 58,101 |
+| rnn | E42 H68 | 14,763 | E102 H166 | 62,139 |
+| lstm | E38 H34 | 14,673 | E86 H76 | 60,147 |
+| attention (1L, 4h) | E28 FFN144 | 15,497 | E60 FFN320 | 61,945 |
+
+**Prediction (pre-registered, by the agent).**
+1. mlp is the flat control: 2.51-2.54 at every tier, total 3.9k -> 60k gain <= 0.02 (information-bound per learning #1), dissociating information-bound flatness from capacity-bound gains everywhere else.
+2. Every other architecture gains >= 0.10 from 3.9k -> 60k, and attention gains the most (>= 0.25): capacity is first-order for every context-aware mechanism at this size, and width is what attention lacks (learning #12 downscaled).
+3. concat re-catches the rnn gradually but does not pass it: the rnn-concat gap shrinks monotonically, 0.050 (3.9k) -> <= 0.03 (15k) -> <= 0.015 (60k), rnn ahead or tied at every tier (weight sharing loses decisiveness as E grows past the per-offset cost; the old 31k/43k pair was already a statistical tie).
+4. 15k bands: rnn 2.10-2.17, concat 2.13-2.20, lstm 2.15-2.25, attention 2.15-2.22; tiny ordering preserved (rnn < concat < lstm < attention).
+5. 60k bands: rnn 1.99-2.06, attention 2.02-2.10, concat 2.04-2.10, lstm 2.04-2.12.
+6. Riskiest call - exactly one ordering inversion, at the top tier: attention passes lstm at 60k (width feeds attention faster than the gate tax relents on a squeezed state), giving rnn < concat < attention < lstm at 60k.
+7. mlp_sum stays strictly worst at every tier but gains >= 0.10 by 60k: at E96 > vocab 65 the embeddings can be linearly independent, so the sum can encode the bag losslessly and superposition interference (the mlp_sum entry's optimization diagnosis) should mostly dissolve; the residual gap is recency dilution, which capacity cannot buy back. Sharp version: sum at 60k still at or above the bigram floor (>= 2.50).
+8. Nobody approaches the context-8 information floor, and the frontier visibly bends: best model at 60k stays >= 0.15 above the position-averaged KN floor of ~1.83 (mean of KN val at k=1..8), and per architecture the 15k -> 60k gain is smaller than the 3.9k -> 15k gain.
+
+**Result.**
+Val loss, mean +/- std over 3 seeds (54 runs total; 3.9k column = tiny-rematch runs):
+
+| model | 3.9k | 15k | 60k | total gain |
+|---|---|---|---|---|
+| mlp | 2.524 +/- 0.005 | 2.512 +/- 0.007 | 2.515 +/- 0.007 | 0.010 |
+| mlp_sum | 2.822 +/- 0.018 | 2.676 +/- 0.010 | 2.617 +/- 0.005 | 0.205 |
+| mlp_concat | 2.315 +/- 0.007 | 2.148 +/- 0.007 | 2.050 +/- 0.007 | 0.265 |
+| rnn | 2.265 +/- 0.018 | 2.094 +/- 0.008 | **1.991 +/- 0.013** | 0.274 |
+| lstm | 2.358 +/- 0.009 | 2.162 +/- 0.005 | 2.029 +/- 0.002 | 0.329 |
+| attention | 2.400 +/- 0.008 | 2.186 +/- 0.010 | 2.085 +/- 0.016 | 0.316 |
+
+Orderings: 3.9k and 15k both give rnn < concat < lstm < attention < mlp < sum; 60k gives rnn < **lstm < concat** < attention < mlp < sum.
+The mlp tier curves (all three capacities collapsing onto the bigram floor, larger models arriving in fewer tokens but no lower) are plotted in curves/mlp_capacity_nll_vs_tokens.png; even on the train split the 60k mlp stops at 2.468, just above the train-split bigram table floor of 2.452 - structurally blind models cannot even memorize past their information floor.
+Prediction 1 confirmed: the mlp frontier is flat to 0.010 nats across 15.7x parameters (and non-monotone 15k -> 60k within noise).
+Prediction 2 half-confirmed: every context-aware architecture gains 0.205-0.329, but the largest gain belongs to the lstm (0.329), not attention (0.316), by a ~1-sigma margin.
+Prediction 3 REFUTED in the interesting direction: the rnn-concat gap does not shrink - it is scale-stable at 0.050 / 0.054 / 0.059, rnn ahead at every tier.
+Concat never re-catches the rnn at matched parameters; the old "tie" (2.070 vs 2.088) compared a 31k rnn against a 43k concat.
+Prediction 4 confirmed (ordering exact; 3 of 4 bands hit, rnn 0.006 better than its band).
+Prediction 5 mostly confirmed (3 of 4 bands; lstm 0.011 *better* than its band).
+Prediction 6 (riskiest) REFUTED: exactly one inversion did occur at 60k, but it was the lstm passing concat (2.029 vs 2.050, ~3 sigma), not attention passing the lstm; attention stays last among context-aware models at every tier.
+Prediction 7 confirmed in all three clauses: sum is strictly worst everywhere, gains 0.205, and still sits at 2.617 >= 2.50 at 60k - 0.10 nats *above* the no-context mlp even though E96 >= vocab makes the bag losslessly encodable.
+Prediction 8 confirmed: rnn at 60k (1.991) sits 0.161 above the ~1.83 position-averaged KN floor, and every architecture's 15k -> 60k gain is smaller than its 3.9k -> 15k gain (e.g. attention 0.214 -> 0.102, rnn 0.171 -> 0.103).
+Train/val gaps grow with capacity (0.02-0.05 at 3.9k, 0.06-0.10 at 15k, 0.11-0.16 at 60k) but no cell shows a val upturn: capacity is beginning to outrun 1.28M tokens without yet overfitting.
+
+**Conclusion / next steps.**
+The information-bound vs capacity-bound dissociation is now measured, not argued: 15.7x parameters moves the context-blind mlp 0.010 nats while every context-aware mechanism gains 0.21-0.33.
+The tiny-rematch's headline finding reverses at scale in one place only: weight sharing's decisive advantage (rnn over concat) is *not* a scarcity artifact - the 0.05 gap survives 3.9k -> 60k unchanged - but the lstm's gate tax is: once H clears ~76, gating overtakes fixed per-offset weights, and the recurrent family occupies the top two slots at 60k.
+Attention's reputation is only half-rehabilitated by capacity: width gives it the biggest single jump at the first quadrupling, yet it remains the worst context-aware mechanism at every tier - at context 8 and 1.28M tokens, width is necessary but not sufficient.
+The sum model's deficit is informational, not optimizational: with a lossless bag encoding available it still loses to no-context, evidence that H(next | bag-8) genuinely exceeds H(next | last char) - recency dilution is a property of the *representation*, and no capacity buys it back.
+Everything bends: returns per 4x params are decelerating at fixed budget, and the whole neural family is still >= 0.16 above the classical floor, with train/val gaps warning that the next quadrupling starts paying rent to overfitting.
+Next: a 240k tier (does the lstm's steeper frontier cross the rnn's, as extrapolation suggests?); the same frontier at 4x iters to unconfound the still-falling curves; and the seq_len 32 six-way comparison still standing from the tiny rematch.
+
+## 2026-07-14: The 15k capacity-matched context ladder - concat squeezed to the twin budget
+
+**Question.**
+The 141.6k controls put the fixed-capacity context optimum near k=8 and showed parameters pay only where the window supplies unextracted information.
+Now squeeze the same ladder down to the reference budget: hold E=32 and match mlp_concat to the k=1 twin's 14,689 params by shrinking H as k grows.
+Where does the context optimum move at 15k params, and how steep does the deep tail get when every added offset is paid for out of a fixed budget?
+
+**Method.**
+Same base as the main grid (seq_len 32, batch 32, lr 1e-3, 5000 iters, 3 seeds); mlp_concat with H solved from params = 2,145 + H(32k + 66) ~= 14,689.
+Cells: k=2 H=96 (14,625), k=3 H=77 (14,619), k=4 H=65 (14,755), k=5 H=56 (14,801), k=8 H=39 (14,703), k=16 H=22 (14,861), k=32 H=12 (15,225).
+All within 1.2% of target except k=32 at +3.7% (inside the rematch's +/-4% convention; the excess favors the cell predicted to lose, so the bias is conservative).
+k=1 is the existing twin cell (H=128, 14,689), not rerun.
+Because sum is 14,689 at every k, this grid also makes concat vs sum an exact param-matched mechanism comparison at every depth.
+
+**Prediction (pre-registered, by the agent).**
+1. The U sharpens and its minimum shifts left as capacity shrinks: minimum at k in {3, 4, 5} with value in [1.90, 1.97], and k=8 worse than that minimum by >= 0.03 with separated seed ranges (at 141.6k params the optimum was k=8).
+2. Every squeezed cell lands above its H=128 counterpart with a penalty monotone in k: within +0.03 at k=2 (capacity was worth ~nothing there), +0.06 to +0.15 at k=8, and +0.20 to +0.50 at k=32 (H=12) - the tail tax is paid in share-of-budget, so it steepens as the budget shrinks.
+3. Mechanism still beats bag at exactly matched params: concat below sum at every k >= 2, but the k=32 margin narrows from 0.98 (H=128 concat) to [0.4, 0.8].
+4. No cell beats 1.90: at this budget capacity binds before mechanism does, and the 141.6k ladder's 1.833 stays out of reach.
+
+**Result.**
+Train / val (nats/char), val as mean +/- std over 3 seeds; 21 runs appended to runs.jsonl; all three concat ladders plus the mlp_sum ladder plotted in curves/context_ladders.png.
+
+| k | H | params | train / val | gap |
+|---|---|---|---|---|
+| 1 | 128 | 14,689 | 2.457 / 2.505 +/- .004 | 0.047 |
+| 2 | 96 | 14,625 | 1.990 / 2.124 +/- .002 | 0.134 |
+| 3 | 77 | 14,619 | 1.833 / **1.993** +/- .008 | 0.160 |
+| 4 | 65 | 14,755 | 1.822 / 1.994 +/- .009 | 0.172 |
+| 5 | 56 | 14,801 | 1.838 / 2.002 +/- .007 | 0.164 |
+| 8 | 39 | 14,703 | 1.894 / 2.045 +/- .008 | 0.151 |
+| 16 | 22 | 14,861 | 2.012 / 2.135 +/- .004 | 0.123 |
+| 32 | 12 | 15,225 | 2.152 / 2.240 +/- .006 | 0.088 |
+
+Prediction 1 confirmed on location, refuted on level: the minimum is at k=3 (1.993, statistically tied with k=4 at 1.994), inside the predicted {3, 4, 5}, and k=8 is worse by 0.052 with separated seed ranges - but 1.993 sits 0.02 above the predicted [1.90, 1.97] band.
+Prediction 2 confirmed in full: the penalty vs the H=128 counterpart is monotone in k - +0.010 / +0.042 / +0.080 / +0.101 / +0.130 / +0.203 / +0.286 at k=2 through 32 - with every checkpoint clause inside its band.
+Prediction 3 confirmed: concat stays below sum at every k >= 2 at exactly matched params, margin 0.199 at k=2 widening to 0.691 at k=32, inside [0.4, 0.8].
+Prediction 4 confirmed: best cell 1.993; the 141.6k ladder's 1.833 is out of reach at this budget.
+Unpredicted finding: the 15k tail rises for the *opposite reason* from the H=128 tail.
+At H=128 the tail was a variance tax (train flat at ~1.70, gap growing 0.195 -> 0.246); at 15k the gap *shrinks* along the tail (0.172 -> 0.088) while train *rises* (1.822 -> 2.152) - H=12 can no longer even fit the training data.
+Same U shape, opposite anatomy: capacity-rich tails fit noise, capacity-starved tails stop fitting signal.
+
+**Conclusion / next steps.**
+Optimal context scales with capacity: 14.7k params -> k=3, the H=128 diagonal -> k=5, 141.6k -> k=8 - a monotone optimum-k(params) relation measured at three budgets.
+The val-only U-curve is degenerate evidence: two mechanically opposite tail failures (fit noise vs cannot fit signal) produce the same shape, and only the train column dissociates them - read train before explaining val.
+Mechanism survives the squeeze: at exactly equal params, ordered per-offset weights beat the bag at every depth, so the 0.2-nat order premium at k=2 is budget-robust and grows with depth.
+Next: a third and fourth budget (~40k, 60k) to test whether optimum-k(params) follows a power law; weight decay on the capacity-rich k=32/H=128 cell to test whether its variance-tax tail flattens (the capacity-starved tail should not respond).
+
+## 2026-07-14: Context ladder at fixed capacity - mlp_sum vs mlp_concat, k = 1 to 32
+
+**Question.**
+The classical ladder showed three deep-context signatures: fixed tables U-turn, WB saturates, KN's tail is free.
+Fix neural capacity at E32/H128 and walk context_k up the same depths (1, 2, 3, 4, 5, 8, 16, 32): which signature does each window mechanism follow - the order-blind bag (mlp_sum) and the ordered window (mlp_concat)?
+
+**Method.**
+`sweep` over the model x context_k grid at BASE_CONFIG + dim_embed 32, dim_hidden 128, seq_len 32; batch 32, lr 1e-3, 5000 iters, 3 seeds, appended to runs.jsonl.
+Supervision is 1024 tokens/step (5.12M tokens ~ 5.7 epochs), 8x the old 128-token standard setting, so cross-entry comparisons carry the learning-#10 caveat.
+Loss is position-averaged over all 32 positions (warm-up caveat, learning #9), unlike the classical ladder's i >= 32 scoring, so classical-column comparisons are directional only.
+Params: sum is constant at 14,689 for every k; concat is 10,593 + 4,096k (14,689 at k=1 up to 141,665 at k=32) - for concat the k axis is confounded with params by construction, since per-offset weights *are* the mechanism.
+Control arm (queued after the main grid): capacity-matched concat cells that isolate params-without-context by raising H at small k to match k=32's 141,665 params - k=2 at H=1073 (141,635) and k=8 at H=433 (141,571), both within 0.1% of target, 3 seeds each.
+First sweep through the new model-saving path: every run's final weights land in models/ with model_path recorded in its runs.jsonl row.
+
+**Prediction (pre-registered, by the agent).**
+1. k=1 twins: mlp_sum and mlp_concat at k=1 build identical architectures (same tensor shapes in the same RNG draw order, same batch stream), so per-seed losses agree to float precision - the strictest seed-discipline check yet.
+Both land in 2.48-2.52 (the neural bigram at this supervision).
+2. mlp_sum traces a U-curve like the fixed table but for a different reason (dilution, not sparsity): best at k=2 (2.38-2.46, edging the 128-token cell 2.462), k=3 within +0.06 of k=2, k=4 back above the k=1 bigram line (the learning-#4 boundary), then monotone worse - k=8 in [2.60, 2.80], k=16 in [2.70, 3.00], k=32 in [2.80, 3.20], while staying below unigram 3.328 (a bag of 32 still beats no context).
+3. mlp_concat follows the KN signature: monotone improvement with diminishing returns and a free tail, no U-turn.
+Bands: k=2 [2.18, 2.30], k=3 [2.02, 2.15], k=4 [1.93, 2.06], k=5 [1.87, 2.00], k=8 [1.78, 1.92], k=16 [1.74, 1.88], and k=32 within 0.04 of its own k=16 value.
+Generalization is what makes deep context free for a parametric model - the property KN has to buy with discounting.
+4. The order gap (sum minus concat at equal k) widens monotonically: ~0 at k=1, 0.15-0.25 at k=2 (learning #3's ~0.2 nats), above 0.8 nats by k=32.
+5. Memorization column: concat k=32 (141k params, ~5.7 epochs) shows the grid's largest train/val gap, 0.08-0.20; sum's gap stays under 0.05 at every k (14.7k params cannot memorize 892k chars).
+6. No cell beats 1.75: at 5.12M tokens supervision is no longer the binding constraint, the one-layer window mechanism is, and KN's 1.634 stands.
+7. Capacity cannot substitute for context: the H-matched k=2 control (7.5x its H=128 cell's params) gains only 0.05-0.15 nats and stays above the H=128 k=5 cell; the H-matched k=8 control (3.3x params) gains 0.03-0.10 and stays above the H=128 k=16 cell.
+Sharpest form: the capacity share of the k=2 -> k=32 concat improvement is under one third.
+
+**Result.**
+Train / val (nats/char), val as mean +/- std over 3 seeds; 48 + 6 runs appended to runs.jsonl, weights in models/.
+
+| k | concat params | concat train / val | sum train / val (14,689 params) |
+|---|---|---|---|
+| 1 | 14,689 | 2.457 / 2.505 +/- .004 | bit-identical to concat |
+| 2 | 18,785 | 1.978 / 2.114 +/- .002 | 2.206 / **2.323** +/- .002 |
+| 3 | 22,881 | 1.770 / 1.951 +/- .005 | 2.224 / 2.383 +/- .006 |
+| 4 | 26,977 | 1.722 / 1.914 +/- .007 | 2.352 / 2.500 +/- .006 |
+| 5 | 31,073 | 1.707 / **1.901** +/- .008 | 2.488 / 2.629 +/- .006 |
+| 8 | 43,361 | 1.696 / 1.915 +/- .009 | 2.660 / 2.776 +/- .010 |
+| 16 | 76,129 | 1.699 / 1.932 +/- .010 | 2.819 / 2.891 +/- .006 |
+| 32 | 141,665 | 1.708 / 1.954 +/- .011 | 2.878 / 2.931 +/- .005 |
+
+Controls: concat k=2 H=1073 (141,635 params) 1.956 / 2.117 +/- .005; concat k=8 H=433 (141,571 params) 1.547 / **1.833** +/- .005.
+
+Prediction 1 confirmed in its strictest form: per-seed val curves are bit-identical between the k=1 twins (2.5050 / 2.4994 / 2.5092), and the mean sits in the predicted band.
+Prediction 2 confirmed in shape, refuted in details: sum's minimum is at k=2 but at 2.323, 0.06 *below* the predicted floor (supervision undervalued again), and the learning-#4 boundary moved - k=4 now ties the bigram line (2.500 vs 2.505) instead of exceeding it, pushing the worse-than-no-context crossover to k=5; the deep cells landed in-band and below unigram.
+Prediction 3 half-refuted, and the refuted half is the finding: k=2-4 beat their bands, but the tail is *not* free - concat U-turns at k=5 and rises to 1.954 by k=32 with cleanly separated seed ranges (the within-0.04-of-k=16 clause survived at +0.022; the no-U-turn clause did not).
+The train column gives the mechanism: train is flat at ~1.70 from k=4 on, so offsets past ~5 extract nothing new, while the train/val gap grows 0.195 -> 0.246 - the val rise (+0.052) is the gap rise (+0.051), a pure variance tax.
+Prediction 4 confirmed: order gap 0.000 / 0.208 / 0.978 at k=1/2/32 - the third independent ~0.2-nat measurement of order in a 2-char window.
+Prediction 5 half-refuted: concat k=32 does carry the grid's largest H=128 gap but at 0.246 it tops the predicted range, and sum's no-memorization clause is wrong - constant 14.7k params show gaps up to 0.159 (k=3), non-monotone in k, so the gap is partly split shift interacting with the window, not capacity memorization.
+Prediction 6 confirmed: best H=128 cell 1.901, best overall cell 1.833, both above 1.75; KN's 1.634 stands.
+Prediction 7 split, and the split is the second finding: at k=2, 7.5x params bought -0.003 (predicted 0.05-0.15 - refuted *low*: capacity alone is worth zero, train barely moved 1.978 -> 1.956), while at k=8, 3.3x params bought 0.082 (in-band; train 1.696 -> 1.547) and the control beat every H=128 cell including the k=5 minimum, refuting the stays-above-k=16 clause.
+The sharpest form (capacity share under one third) is confirmed at the k=2 anchor, but the true structure is an interaction: parameters pay only where the window supplies unextracted information.
+
+**Conclusion / next steps.**
+Neither neural window model earns KN's free tail: sum U-turns from dilution, concat U-turns from a parameter-variance tax - but generalization softens the deep-context penalty ~40x relative to counting (fixed table +2.30 from its minimum to k=32, concat +0.05).
+The tail's cost tracks what depth *buys*: free when depth costs no parameters (KN via discounting; rnn/lstm via recurrence per the earlier grids), taxed when every extra step buys weights (concat) and poisonous when it dilutes the signal (sum).
+The three 141.6k-param cells form the capacity-matched context ladder the confound question demanded: k=2 2.117, k=8 **1.833**, k=32 1.954 - at fixed parameters the context optimum is ~8, and the H=128 grid's k=5 minimum was partly an artifact of starving the deeper cells of width.
+Learning-#14's dissociation now reproduces *within* one architecture along its own context axis: at k=2 the model is information-bound (7.5x params buys 0.000), at k=8 it was capacity-bound (3.3x buys 0.082).
+Cross-entry comparisons carry the 8x-supervision caveat: concat k=8 H=433's 1.833 is not scoreboard-comparable to the 128-token cells, and KN still leads by 0.20 on a shared-split basis.
+Next: an H sweep at k=8 to find where width saturates (gap 0.286 says regularization or early stopping may pay before more width does); weight decay on the k=32 cell to test whether concat's tail tax is removable - if regularization makes the tail free, the mechanism story sharpens to "the U-turn is pure estimation noise, not representation".
+
+## 2026-07-14: All six architectures at ~3.9k params and 1.28M tokens (the tiny-budget rematch)
+
+**Question.**
+The new BASE_CONFIG shrinks the reference mlp to 3,857 params and raises supervision to 256 tokens/step (batch 32 x seq_len 8; 5000 iters = 1.28M tokens ~= 1.4 epochs).
+Where do the six neural architectures land when *both* parameters (~3.9k, +/-4%) and training tokens (1.28M) are matched, at context <= 8?
+Prior comparisons matched neither: the old grid had params ranging 15k-31k at 128 tokens/step.
+
+**Method.**
+Param-matched configs found by dim search against the mlp reference (vocab 65, seq_len 8, context_k 8 for the window models):
+mlp E16/H32 (3,857), mlp_sum E12/H40 (3,965), mlp_concat E8/H24 (3,705), rnn E16/H26 (3,913), lstm E16/H14 (3,751), attention 1L/4h E12/FFN64 (3,993).
+All at batch 32, seq_len 8, lr 1e-3, 5000 iters, 3 seeds, appended to runs.jsonl; seed-0 curves exported to curves/*.csv.
+Same seed => bit-identical batch sequences across models (batches come from np.random, init from torch).
+
+**Prediction (pre-registered, by the agent).**
+1. mlp stays pinned at the bigram floor: 2.50-2.53 val (seed-0 run already showed 2.518).
+2. mlp_sum k=8 remains worse than no context at all: 2.70-2.85 (bag dilution + superposition is representational, so the capacity cut changes little).
+3. concat and rnn stay within 0.05 of each other (context 8 saturates both mechanisms per the architecture-vs-context entry) and land in 2.05-2.20: the 4x param cut costs a little, the 2x supervision gives a little back.
+4. lstm loses to rnn by >= 0.03: at 3.8k params the gate tax squeezes state width to 14 vs the rnn's 26, and state width binds at equal params (learning #11).
+5. attention is the worst context-aware model: 2.25-2.40 at E12 (it was 2.218 at E32/17.9k params, and width is what attention needs most).
+6. Full predicted val ordering: rnn ~= concat < lstm < attention < mlp < sum.
+
+**Result.**
+Val loss, mean +/- std over 3 seeds (train/val curves for seed 0 in curves/*.csv):
+
+| model | params | dims | val loss |
+|---|---|---|---|
+| rnn | 3,913 | E16 H26 | **2.265 +/- 0.018** |
+| mlp_concat | 3,705 | E8 H24 k8 | 2.315 +/- 0.007 |
+| lstm | 3,751 | E16 H14 | 2.358 +/- 0.009 |
+| attention | 3,993 | E12 FFN64 1L | 2.400 +/- 0.008 |
+| mlp | 3,857 | E16 H32 | 2.524 +/- 0.005 |
+| mlp_sum | 3,965 | E12 H40 k8 | 2.822 +/- 0.018 |
+
+Predictions 1, 2, 4, 5 confirmed: mlp pinned at the bigram floor (2.524); sum worse than no context (2.822); lstm loses to rnn by 0.093 (gate tax at H=14 vs H=26); attention worst context-aware model (2.400, at the top of its predicted band).
+Prediction 3 half-refuted: the level band was wrong (both landed 0.10-0.11 above 2.20 - the 4x param cut cost more than the 2x supervision returned), and the "concat ~= rnn" tie from the 15k-param grid did *not* survive the squeeze: rnn wins by 0.050 with non-overlapping seed ranges.
+Prediction 6 (full ordering) confirmed exactly: rnn < concat < lstm < attention < mlp < sum.
+Train/val gaps are 0.02-0.04 everywhere: capacity/budget-bound, not overfitting.
+
+**Conclusion / next steps.**
+The mechanism ladder is scale-robust downward: the same ordering as the 15k-31k grid holds at 3.9k params.
+But the earlier "mechanism is invisible at short context" finding is a *capacity-conditional* fact, not a universal one: when parameters are scarce, weight sharing becomes the decisive mechanism property - concat must buy each offset its own weights out of an E=8 embedding budget, while the rnn reuses one cell, and the tie breaks 0.05 in the rnn's favor at the same context.
+Gating (lstm) and dynamic selection (attention) are luxuries the budget cannot pay for at 3.9k params; both invert their large-scale reputations.
+Every model sits 0.59+ nats above the KN depth-8 floor (1.659): tiny neural models are nowhere near counting on this data.
+Next: the same six-way comparison at seq_len 32 to see whether the rnn's win grows with context reach, and a params-vs-loss frontier per architecture (3.9k / 15k / 60k) to locate where concat re-catches the rnn.
+
+## 2026-07-14: The full classical ladder to k=32 - train columns and the deep-context tail
+
+**Question.**
+The classical models have never been run past context 8 (KN was "capped at depth 8; deeper levels are memory-prohibitive"), and the backoff methods have no train-side numbers at all.
+What do train and val NLL look like for the fixed table (alpha=0.01), Witten-Bell, and Kneser-Ney at k in {1, 2, 3, 4, 5, 8, 16, 32} - in particular, do the backoff ladders keep rising past k=8, and what does the train/val gap say about how much each method memorizes?
+
+**Method.**
+New `deep_ladder` in `experiments/ngram.py`: instead of materializing all k+1 backoff levels at once (the old memory cap), stream one count level at a time and fold it into a running per-position interpolated probability - WB applies every level in sequence, and KN maintains its lower-order continuation chain q with the raw top level applied at each requested depth.
+Peak memory becomes ~2 levels regardless of depth; tables are bytes-keyed.
+All methods are scored on positions i >= 32 of each split so every cell shares one prediction set (earlier entries scored i >= k; shifts numbers by < 0.005, checked against the known k <= 7 values).
+
+**Prediction (pre-registered).**
+1. Fixed table (a=0.01): val reproduces the known U-curve (min 1.876 at k=4, ln 65 = 4.174 by k=32) while train falls monotonically to ~0.49 at k=32 - the pure-memorization floor, since nearly all 32-char train contexts are singletons and -ln(1.01/1.65) = 0.49.
+2. WB val keeps rising past its k=4 minimum but saturates: k=16 lands in [2.0, 2.3] and k=32 is within 0.05 of k=16, because an unseen long context is skipped by the recursion, and val positions whose deep contexts do match train become rare quickly with depth.
+3. KN val stays in [1.63, 1.69] at every k >= 5: no U-turn, deep context is harmless under discounting, and no new best (1.634 at k=5 stands within noise).
+4. The train/val gap at k >= 8 orders the methods by memorization: fixed >> WB >> KN. Sharpest form: WB train falls below 0.1 by k=32 (once train contexts are unique, every level is a singleton with lam = 0.5 and ML = 1, so the chain pushes p to 1 geometrically), while KN train stays above 0.2 because discounting caps what a singleton can contribute.
+
+**Result.**
+Train / val NLL (nats/char), all cells scored on positions i >= 32 of each split; known k <= 7 values reproduced to ~0.001 first.
+
+| k | contexts | fixed a=0.01 | WB backoff | Kneser-Ney |
+|---|---|---|---|---|
+| 1 | 65 | 2.449 / 2.509 | 2.449 / 2.504 | 2.449 / 2.504 |
+| 2 | 1,360 | 1.899 / 2.132 | 1.901 / 2.105 | 1.900 / 2.100 |
+| 3 | 10,899 | 1.491 / 1.885 | 1.497 / 1.866 | 1.496 / 1.796 |
+| 4 | 46,224 | 1.235 / **1.876** | 1.236 / **1.790** | 1.243 / 1.654 |
+| 5 | 125,229 | 1.045 / 2.118 | 1.023 / 1.828 | 1.051 / **1.634** |
+| 8 | 508,736 | 0.657 / 3.253 | 0.455 / 2.103 | 0.632 / 1.659 |
+| 16 | 864,915 | 0.493 / 4.142 | 0.023 / 2.326 | 0.431 / 1.658 |
+| 32 | 891,327 | 0.491 / 4.174 | 0.0002 / 2.334 | 0.422 / 1.658 |
+
+Prediction 1 confirmed to the third decimal: fixed-table train bottoms out at 0.4905 vs the predicted singleton floor -ln(1.01/1.65) = 0.4914, and val hits ln 65 = 4.1744 exactly at k=32.
+Prediction 2 split: the saturation clause is confirmed (k=32 is within 0.008 of k=16) but the level band is narrowly refuted, k=16 = 2.326 vs the predicted [2.0, 2.3] - the k=8 -> 16 rise (+0.22) was underestimated, since levels 9-16 still have 618k-865k distinct contexts and therefore still fire often on val.
+Prediction 3 confirmed: KN sits at 1.634 / 1.659 / 1.658 / 1.658 from k=5 on - no U-turn, and the deep tail is even epsilon-favorable (k=16 and 32 land a hair below k=8).
+The depth-8 cap in the attention-comparison entry is retroactively validated: exact KN at k=16/32 (1.658) vs the capped value quoted there (1.659).
+Prediction 4 confirmed in its sharpest form: at k=32 the train/val gaps are fixed 3.68 >> WB 2.33 >> KN 1.24, and WB train is 0.0002 - the WB chain reproduces the training text essentially byte-for-byte, exactly the geometric singleton argument (every unique-context level blends in ML = 1 at lam = 0.5).
+
+**Conclusion / next steps.**
+The three classical methods now have complete memorization signatures, and they cleanly dissociate memorization from val behavior.
+The fixed table memorizes (train 0.49) and collapses (val 4.17).
+WB memorizes *harder* (train 0.0002 at k=32, a near-lossless copy of the corpus) yet only saturates on val: its singleton trust means every deep level is pure memorization, which costs it 0.54 nats of val vs its own k=4 best because matched-but-divergent val contexts get their probability halved level after level.
+KN refuses most singleton evidence (train stays at 0.42) and in exchange is the only method whose deep-context tail is free: val flat at 1.658 from k=8 to k=32.
+So discounting is not just a fix for the U-turn - it is what makes context extension costless, the property the neural models get from generalization.
+The classical scoreboard is unchanged: KN 1.634 at k=5 remains the number to beat.
+The streaming evaluator (`deep_ladder`) removes the old depth-8 memory cap for future deep-context comparisons.
+Still standing: modified KN (per-count discounts) for a tighter floor; refreshing the lstm+KN mixture with the 80k-iter lstm.
 
 ## 2026-07-13: Loss vs iterations - which at-budget rankings survive convergence?
 
@@ -84,10 +516,29 @@ Curves land in runs.jsonl, so both final and minimum val loss are recoverable pe
 5. On the compute axis the ranking flips: lstm at 80k (~5.8 TFLOPs) beats attention-384 at 5k (41 TFLOPs) by at least 0.05 - small-model-trained-longer beats big-model-trained-short at 7x less compute.
 
 **Result.**
-Pending.
+Final val loss by budget (5k = 3-seed mean; 20k/80k = seed 0; eval noise ~+/-0.01-0.02):
+
+| model | params | 5k | 20k | 80k final | 80k min (@ iter) | train @ 80k |
+|---|---|---|---|---|---|---|
+| `mlp_concat` k=32 | 142k | 2.059 | 2.003 | 2.012 | 1.981 (60k) | 1.617 |
+| `rnn` | 31k | 1.970 | 1.885 | 1.829 | 1.827 (60k) | 1.601 |
+| `lstm` H=128 | 93k | 1.923 | 1.801 | 1.713 | 1.713 (80k, still falling) | 1.466 |
+| `attention` 6L x 128d | 1.2M | 1.913 | 1.773 | 1.687 | 1.680 (72k) | 1.331 |
+| `attention` 6L x 384d | 10.7M | 1.883 | 1.743 | 1.700 | 1.669 (52k) | 1.261 |
+
+Prediction 1 partially refuted: one rank inversion, caused by overfitting - by final val the 1.2M transformer passes the 10.7M one (1.687 vs 1.700); by min val the order survives (1.680 vs 1.669). Concat's early-convergence clause confirmed (best ~1.96-1.98, flat-to-worse after 10-20k).
+Prediction 2 REFUTED: the 10.7M model bottoms at 1.669 at iter 52k and then *rises* - it never reaches [1.50, 1.62] and **KN (1.634) survives 16x budget unbeaten** by every single model.
+Prediction 3 confirmed: overfitting onset ordered exactly by params/data ratio - 384d turns up at 52k (train 1.26 vs val 1.70), 128d marginally at 72k, the small recurrent models end on their minima.
+Prediction 4 confirmed: the LSTM-rnn gap compounds, 0.047 -> 0.084 -> 0.116.
+Prediction 5 confirmed: lstm at 80k (5.7 TFLOPs) reaches 1.713, beating the 41-TFLOP attention-384 5k snapshot (1.883) at 7x less compute.
+
+Compute frontier at 80k: lstm 1.713 @ 5.7 TFLOPs; attention-128 1.687 @ 74 TFLOPs; attention-384 1.669 @ 657 TFLOPs - 9x the compute of attention-128 buys 0.011 nats.
 
 **Conclusion / next steps.**
-Pending.
+Convergence reshuffles the podium (the LSTM and both transformers all pass the rnn's 5k-era crown) but the deepest at-budget conclusion stands: counting is still champion among single models, because unregularized neural scale overfits 892k characters before reaching the counting floor.
+The missing ingredients for beating KN are now enumerable rather than mysterious: regularization (dropout/weight decay - bigram.py's 1.48 uses dropout 0.2), longer context (block 256 vs our 32), and a LR schedule - tokens alone were not the answer.
+The compute frontier belongs to the recurrent models at the low end; capacity only pays when data (and regularization) can feed it.
+Next candidates: a regularization entry (dropout + weight decay on the 6L transformers), context 256, and refreshing the KN mixture with the lstm@80k component (its 1.713 vs the 1.923 used previously should push the 1.567 mixture lower).
 
 ## 2026-07-13: Does width unlock attention? (the fan-out experiment, at last)
 

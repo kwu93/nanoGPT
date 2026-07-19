@@ -8,6 +8,8 @@ version = "0.1.0"
 [tasks]
 train = "python -m experiments.train"
 sweep = "python -m experiments.sweep"
+sample = "python -m experiments.sample"
+kn-anatomy = "python -m experiments.kn_anatomy"
 
 [dependencies]
 python = "3.11.*"

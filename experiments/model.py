@@ -15,6 +15,17 @@ def build_model(config):
     return MODELS[config['model']](config)
 
 
+def mlp_block(dim_in, dim_hidden, dim_out, dropout=0.0):
+    """Shared two-layer MLP with optional dropout on the hidden activations.
+    The Dropout module is only inserted when active so checkpoints saved
+    before the dropout option existed keep their state_dict layout."""
+    layers = [nn.Linear(dim_in, dim_hidden), nn.ReLU()]
+    if dropout:
+        layers.append(nn.Dropout(dropout))
+    layers.append(nn.Linear(dim_hidden, dim_out))
+    return nn.Sequential(*layers)
+
+
 class AutoregressiveModel(nn.Module):
     """Shared sampling loop: feed the last seq_len tokens, sample the next."""
 
@@ -42,11 +53,8 @@ class MLPModel(AutoregressiveModel):
         vocab_size, seq_len = config['vocab_size'], config['seq_len']
         self.token_embedding = nn.Embedding(vocab_size, dim_embed)
         self.pos_embedding = nn.Embedding(seq_len, dim_embed)
-        self.block = nn.Sequential(
-            nn.Linear(dim_embed, dim_hidden),
-            nn.ReLU(),
-            nn.Linear(dim_hidden, vocab_size),
-        )
+        self.block = mlp_block(dim_embed, dim_hidden, vocab_size,
+                               config.get('dropout', 0.0))
 
     def forward(self, x, y=None):
         B, T = x.shape
@@ -228,11 +236,8 @@ class SumMLPModel(AutoregressiveModel):
         dim_embed, dim_hidden = config['dim_embed'], config['dim_hidden']
         vocab_size = config['vocab_size']
         self.token_embedding = nn.Embedding(vocab_size, dim_embed)
-        self.block = nn.Sequential(
-            nn.Linear(dim_embed, dim_hidden),
-            nn.ReLU(),
-            nn.Linear(dim_hidden, vocab_size),
-        )
+        self.block = mlp_block(dim_embed, dim_hidden, vocab_size,
+                               config.get('dropout', 0.0))
 
     def forward(self, x, y=None):
         B, T = x.shape
@@ -262,11 +267,8 @@ class ConcatMLPModel(AutoregressiveModel):
         dim_embed, dim_hidden = config['dim_embed'], config['dim_hidden']
         vocab_size, context_k = config['vocab_size'], config['context_k']
         self.token_embedding = nn.Embedding(vocab_size, dim_embed)
-        self.block = nn.Sequential(
-            nn.Linear(context_k * dim_embed, dim_hidden),
-            nn.ReLU(),
-            nn.Linear(dim_hidden, vocab_size),
-        )
+        self.block = mlp_block(context_k * dim_embed, dim_hidden, vocab_size,
+                               config.get('dropout', 0.0))
 
     def forward(self, x, y=None):
         B, T = x.shape

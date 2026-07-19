@@ -128,6 +128,119 @@ class KneserNeyModel:
         return p
 
 
+DEEP_DEPTHS = (1, 2, 3, 4, 5, 8, 16, 32)
+
+
+def deep_ladder(depths=DEEP_DEPTHS, alpha=0.01, config=BASE_CONFIG, verbose=True):
+    """Train/val NLL for the fixed-alpha table, Witten-Bell, and Kneser-Ney
+    at each context length in depths, including depths where materializing
+    every backoff level at once would blow memory (k=32 needs 33 levels).
+
+    Both backoff models fold lower orders into the estimate one level at a
+    time, so instead of keeping all levels alive we stream them: build level
+    k's counts, update a running per-position probability for every scored
+    position, record NLLs if k is a requested depth, then free the level.
+    WB applies each level directly; KN keeps its lower-order continuation
+    chain q running and applies the raw top level only at requested depths
+    (cont level k-1 is derived from raw level k, so one build serves both).
+    Tables are bytes-keyed (vocab < 256). Every split is scored on positions
+    i >= max(depths) so all cells share one prediction set; earlier journal
+    entries scored i >= k, which shifts values by < 0.005.
+    """
+    from math import log
+
+    data, chars = load_data(config)
+    V = len(chars)
+    max_k = max(depths)
+    splits = {name: bytes(data[name].tolist()) for name in ('train', 'val')}
+    train_b = splits['train']
+    chains = {name: {'wb': [1.0 / V] * (len(b) - max_k), 'q': [1.0 / V] * (len(b) - max_k)}
+              for name, b in splits.items()}
+    results = {k: {} for k in depths}
+
+    for k in range(max_k + 1):
+        pairs = {}
+        for i in range(k, len(train_b)):
+            key = train_b[i - k:i + 1]
+            pairs[key] = pairs.get(key, 0) + 1
+        ctxs, distinct = {}, {}
+        for key, c in pairs.items():
+            ctx = key[:-1]
+            ctxs[ctx] = ctxs.get(ctx, 0) + c
+            distinct[ctx] = distinct.get(ctx, 0) + 1
+
+        for name, b in splits.items():
+            wb = chains[name]['wb']
+            for idx in range(len(wb)):
+                i = idx + max_k
+                ctx = b[i - k:i]
+                c = ctxs.get(ctx)
+                if c is None:
+                    continue
+                lam = c / (c + distinct[ctx])
+                wb[idx] = lam * (pairs.get(b[i - k:i + 1], 0) / c) + (1 - lam) * wb[idx]
+
+        if k >= 1:
+            cont_pairs = {}
+            for key in pairs:
+                ckey = key[1:]
+                cont_pairs[ckey] = cont_pairs.get(ckey, 0) + 1
+            cont_ctxs, cont_distinct = {}, {}
+            for ckey, c in cont_pairs.items():
+                ctx = ckey[:-1]
+                cont_ctxs[ctx] = cont_ctxs.get(ctx, 0) + c
+                cont_distinct[ctx] = cont_distinct.get(ctx, 0) + 1
+            n1 = sum(1 for c in cont_pairs.values() if c == 1)
+            n2 = sum(1 for c in cont_pairs.values() if c == 2)
+            cont_D = n1 / (n1 + 2 * n2) if n1 + 2 * n2 else 0.5
+            for name, b in splits.items():
+                q = chains[name]['q']
+                for idx in range(len(q)):
+                    i = idx + max_k
+                    ctx = b[i - k + 1:i]
+                    total = cont_ctxs.get(ctx)
+                    if total is None:
+                        continue
+                    c = cont_pairs.get(b[i - k + 1:i + 1], 0)
+                    q[idx] = max(c - cont_D, 0) / total + (cont_D * cont_distinct[ctx] / total) * q[idx]
+
+        if k in depths:
+            n1 = sum(1 for c in pairs.values() if c == 1)
+            n2 = sum(1 for c in pairs.values() if c == 2)
+            raw_D = n1 / (n1 + 2 * n2) if n1 + 2 * n2 else 0.5
+            for name, b in splits.items():
+                wb, q = chains[name]['wb'], chains[name]['q']
+                nll_a, nll_kn = 0.0, 0.0
+                for idx in range(len(wb)):
+                    i = idx + max_k
+                    ctx = b[i - k:i]
+                    c_pair = pairs.get(b[i - k:i + 1], 0)
+                    total = ctxs.get(ctx)
+                    nll_a -= log((c_pair + alpha) / ((total or 0) + alpha * V))
+                    if total is None:
+                        nll_kn -= log(q[idx])
+                    else:
+                        nll_kn -= log(max(c_pair - raw_D, 0) / total
+                                      + (raw_D * distinct[ctx] / total) * q[idx])
+                n = len(wb)
+                results[k][name] = {
+                    'alpha': nll_a / n,
+                    'wb': -sum(map(log, wb)) / n,
+                    'kn': nll_kn / n,
+                }
+            if verbose:
+                r = results[k]
+                print(f"k={k:>2}  contexts={len(ctxs):>9,}  "
+                      f"alpha {r['train']['alpha']:.4f}/{r['val']['alpha']:.4f}  "
+                      f"WB {r['train']['wb']:.4f}/{r['val']['wb']:.4f}  "
+                      f"KN {r['train']['kn']:.4f}/{r['val']['kn']:.4f}  (train/val)",
+                      flush=True)
+        elif verbose:
+            print(f"k={k:>2}  contexts={len(ctxs):>9,}  (level folded in)", flush=True)
+
+    return results
+
+
 if __name__ == '__main__':
     data, chars = load_data(BASE_CONFIG)
     train_ids, val_ids = data['train'].tolist(), data['val'].tolist()

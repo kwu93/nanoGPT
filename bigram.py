@@ -5,9 +5,9 @@ from torch.nn import functional as F
 
 
 #### -------- Hyperparameters --------
-batch_size = 64
+batch_size = 16
 learning_rate =  3e-4
-context_window = 256
+context_window = 8
 max_iters = 5000
 device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
 eval_iters = 200
