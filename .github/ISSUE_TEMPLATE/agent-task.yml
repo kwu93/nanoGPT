@@ -1,0 +1,30 @@
+name: Agent task
+description: Queue a task for a coding agent to implement
+labels: ["agent-task", "queued"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What should be built or changed, and why.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How to tell the task is done. Be concrete and checkable.
+    validations:
+      required: true
+  - type: textarea
+    id: local-run
+    attributes:
+      label: Local run (optional)
+      description: >-
+        Fill this in only if part of the task must execute on the local worker
+        machine (training runs, GPU, local data). Describe what to run and what
+        artifacts it should produce. The implementing agent will write
+        .agent/tasks/issue-<n>.json and label the PR needs-local-run instead of
+        running it in CI.
+    validations:
+      required: false

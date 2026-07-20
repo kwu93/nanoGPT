@@ -1,0 +1,11 @@
+{
+  "_readme": "agent-kit settings. worker.command runs on the maintainer's machine for each PR labeled needs-local-run; {task_file} is replaced with the path to the PR's .agent/tasks/issue-<n>.json (the worker reads this file from the default branch only, never from the PR branch). implementer.claude_args are extra CLI args for the local Claude Code sessions that scripts/drain.py launches per queued issue; add Bash allowlist entries for your repo's toolchain, or --dangerously-skip-permissions if you accept unattended full access.",
+  "worker": {
+    "command": null,
+    "max_minutes": 120
+  },
+  "implementer": {
+    "claude_args": "--permission-mode acceptEdits --allowedTools \"Bash(git:*)\" \"Bash(gh:*)\"",
+    "max_minutes": 45
+  }
+}
