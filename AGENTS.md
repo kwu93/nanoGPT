@@ -16,4 +16,13 @@ When reviewing a PR (for example via `@codex review`):
 
 ## Project specifics
 
-<!-- agent-kit: fill this in per repo. Build/test commands, code layout, domain conventions. -->
+Research repo: from-scratch char-level language models on tiny Shakespeare, run as pre-registered experiments; `PROCESS.md` is the authoritative contract.
+One experiment = one directory `experiments/runs/NNN-<slug>/` (spec.md, config.py, runs.jsonl, report.md) = one PR; sweeps execute only via the local worker.
+Root `model.py` / `train.py` are karpathy's originals and stay untouched; Kevin's code is `solo.py` and `experiments/`.
+
+Extra review checks for experiment PRs:
+
+- The spec commit (predictions) must precede the results commit; pre-registration is the point.
+- Every number in `report.md` must be traceable to rows in that experiment's `runs.jsonl`.
+- `experiments/protocols.py` is append-only; flag any edit to an existing protocol.
+- `*.pt` checkpoints must never be committed; `experiments/runs/_template/` stays untouched.
