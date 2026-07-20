@@ -7,22 +7,9 @@ import torch
 from torch.nn import functional as F
 
 from .model import build_model
+from .protocols import PROTOCOLS
 
-BASE_CONFIG = {
-    'model': 'mlp',
-    'data_path': 'input.txt',
-    'test_ratio': 0.2,
-    'seq_len': 8,
-    'batch_size': 64,
-    'dim_embed': 64,
-    'dim_hidden': 256,
-    'lr': 1e-3,
-    'weight_decay': 0.1,
-    'num_iters': 10000,
-    'eval_every': 1000,
-    'eval_iters': 100,
-    'device': 'cpu',
-}
+BASE_CONFIG = {**PROTOCOLS['ref-v2'], 'model': 'mlp'}
 
 
 def load_data(config):

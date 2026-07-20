@@ -1,6 +1,6 @@
 # Research Journal, page 2
 
-Continuation of `JOURNAL.md` (page 1), same conventions: log the proposed explanation as a hypothesis with a falsifiable prediction *before* running the experiment, then record the result.
+Continuation of `page1.md`, same conventions: log the proposed explanation as a hypothesis with a falsifiable prediction *before* running the experiment, then record the result.
 Page 1 closed with the scoreboard at the old standard setting (dim_embed 32, dim_hidden 128, 5000 iters); this page opens the larger reference scale.
 
 ## 2026-07-16: Dropout 0.2 on top of weight decay - the concat ladder
