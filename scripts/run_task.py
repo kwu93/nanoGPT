@@ -10,11 +10,27 @@ to the PR branch by the worker.
 """
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 RUNS_ROOT = Path('experiments/runs')
+LOCAL_DATA = ('input.txt',)  # gitignored corpus files sweeps read from the repo root
+
+
+def ensure_local_data():
+    """The worker runs this script in an ephemeral worktree, which starts
+    without gitignored local data. Copy it from the main checkout the
+    worktree hangs off (the parent of the shared git dir)."""
+    git_dir = subprocess.run(['git', 'rev-parse', '--git-common-dir'],
+                             capture_output=True, text=True, check=True).stdout.strip()
+    main_root = Path(git_dir).resolve().parent
+    for name in LOCAL_DATA:
+        src, dst = main_root / name, Path(name)
+        if src.is_file() and not dst.exists():
+            print(f'copying {src} -> {dst}')
+            shutil.copyfile(src, dst)
 
 
 def main():
@@ -28,6 +44,7 @@ def main():
         sys.exit('refusing to run the template directory')
     if not (exp_dir / 'config.py').is_file():
         sys.exit(f'{exp_dir}/config.py not found')
+    ensure_local_data()
     subprocess.run([sys.executable, '-m', 'experiments.sweep', str(exp_dir)],
                    check=True)
 
