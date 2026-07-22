@@ -17,10 +17,11 @@ Neural entries quote mean best_val_loss over 3 seeds.
 |---|---|---|---|
 | `mlp_sum`, wd 0.1 | k=3 | 2.269 | page 2, weight-decay entry |
 | `mlp_concat`, wd 0.1 | k=5 | 1.772 | page 2, weight-decay entry |
-| `mlp_concat`, wd 0.1 + dropout 0.2 | k=8 | **1.769** | page 2, dropout entry |
+| `mlp_concat`, wd 0.1 + dropout 0.2 | k=8 | 1.769 | page 2, dropout entry |
+| `rnn`, wd 0.1 | H=325; k=8 and unbounded tie | **1.680** | [001](experiments/runs/001-rnn-vs-concat) |
 | Kneser-Ney backoff | 5 chars | **1.634** | page 1 |
 
-KN's margin over the best neural window model is 0.135 nats, down from 0.267 at the page-1 standard setting.
+KN's margin over the best neural model is 0.046 nats (`rnn`, 001), down from 0.135 over the best window model and 0.267 at the page-1 standard setting.
 Matched-scoring anatomy (val positions with full 32-char context only): concat k=8 scores 1.739 against KN depth-8's 1.659, and the gap concentrates almost entirely off-support (page 2, KN-anatomy entry).
 
 ### Standard setting (`std-v1`: E32/H128, ~128 tokens/step, 5k iters) - frozen 2026-07-13
@@ -50,7 +51,7 @@ One row per experiment under the new structure; the id links to the experiment d
 
 | id | date | question | verdict |
 |---|---|---|---|
-| - | - | (none yet) | - |
+| [001](experiments/runs/001-rnn-vs-concat) | 2026-07-21 | does the rnn's page-1 win over `mlp_concat` survive ref-v2 regularization, and is it weight sharing (H1) or context reach (H2)? | rnn wins every cell (1.680 vs 1.776 at matched params); windowing the rnn to k=8 costs nothing, so weight sharing carries the entire margin; the matched-params gap doubled under wd instead of collapsing |
 
 Legacy entries: 21 on page 1 and 4 on page 2; their section headers are the index.
 
@@ -65,4 +66,5 @@ Cost accounting (storage / compute / data budgets and how winners flip) is in th
 - The causal off-support test: train concat k=8 with random context truncation; if the d<=3 bucket gap closes materially, the KN-anatomy diagnosis is confirmed.
 - Score the existing attention checkpoints per-d-bucket for the same off-support signature.
 - Refresh the LSTM+KN mixture with per-bucket weights now that we know where each model wins.
-- rnn / lstm / attention scale-up under the regularized `ref-v2` protocol.
+- lstm / attention scale-up under the regularized `ref-v2` protocol (rnn: done, 001).
+- Per-d-bucket rnn-vs-KN anatomy (H3 follow-up from 001): does contractive recurrence buy KN-style off-support robustness where concat collapsed?
