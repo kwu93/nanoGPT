@@ -1,0 +1,5 @@
+{
+  "issue": 1,
+  "command_args": "experiments/runs/001-rnn-vs-concat",
+  "expected_artifacts": ["experiments/runs/001-rnn-vs-concat/runs.jsonl"]
+}

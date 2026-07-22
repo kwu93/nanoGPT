@@ -155,7 +155,14 @@ class RNNModel(AutoregressiveModel):
     read out for the next-char prediction at every position. Shares weights
     across offsets like mlp_sum, but composition is non-commutative so order
     survives; parameter count is independent of context length, and context
-    is unbounded in principle (capped at seq_len here by the batch window)."""
+    is unbounded in principle (capped at seq_len here by the batch window).
+
+    Optional `context_k` (windowed recurrence): position t's state is rebuilt
+    from h=0 over the last min(t+1, k) tokens only, so every prediction is
+    structurally blind past k characters, matching mlp_concat's reach at the
+    same k. Absent or None keeps the unbounded behavior above, and
+    context_k >= seq_len coincides with it; no parameters change either way,
+    so pre-existing checkpoints load unmodified."""
 
     def __init__(self, config):
         super().__init__()
@@ -170,12 +177,31 @@ class RNNModel(AutoregressiveModel):
     def forward(self, x, y=None):
         B, T = x.shape
         emb = self.token_embedding(x)
-        h = emb.new_zeros(B, self.wh.in_features)
-        states = []
-        for t in range(T):
-            h = torch.tanh(self.wx(emb[:, t]) + self.wh(h))
-            states.append(h)
-        logits = self.head(torch.stack(states, dim=1))
+        k = self.config.get('context_k')
+        if k is None:
+            h = emb.new_zeros(B, self.wh.in_features)
+            states = []
+            for t in range(T):
+                h = torch.tanh(self.wx(emb[:, t]) + self.wh(h))
+                states.append(h)
+            hidden = torch.stack(states, dim=1)
+        else:
+            # One k-token window per position (slot 0 = oldest), recurrence
+            # run over all B*T windows at once: k loop steps instead of T,
+            # each a matmul over B*T rows. Slots that would reach before the
+            # sequence start are no-ops (state stays at its h=0 init), so a
+            # short prefix is treated exactly as the unbounded path treats it.
+            shifted = [F.pad(emb, (0, 0, j, 0))[:, :T] for j in range(k - 1, -1, -1)]
+            windows = torch.stack(shifted, dim=2).view(B * T, k, -1)
+            valid = (torch.arange(T, device=x.device).unsqueeze(1)
+                     >= torch.arange(k - 1, -1, -1, device=x.device))
+            valid = valid.expand(B, T, k).reshape(B * T, k)
+            h = emb.new_zeros(B * T, self.wh.in_features)
+            for s in range(k):
+                h_next = torch.tanh(self.wx(windows[:, s]) + self.wh(h))
+                h = torch.where(valid[:, s].unsqueeze(1), h_next, h)
+            hidden = h.view(B, T, -1)
+        logits = self.head(hidden)
         if y is None:
             loss = None
         else:
